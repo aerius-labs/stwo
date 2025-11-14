@@ -39,6 +39,12 @@ pub struct MetalContext {
     /// IFFT radix-8 kernel pipeline.
     ifft_radix8_pipeline: ComputePipelineState,
 
+    /// FFT radix-2 kernel pipeline (for vecwise layers).
+    fft_radix2_pipeline: ComputePipelineState,
+
+    /// IFFT radix-2 kernel pipeline (for vecwise layers).
+    ifft_radix2_pipeline: ComputePipelineState,
+
     /// FRI fold (circle) kernel pipeline.
     fri_fold_circle_pipeline: ComputePipelineState,
 
@@ -88,6 +94,8 @@ impl MetalContext {
         // Compile all pipeline states
         let fft_radix8_pipeline = Self::create_pipeline(&device, &library, "circle_fft_radix8")?;
         let ifft_radix8_pipeline = Self::create_pipeline(&device, &library, "circle_ifft_radix8")?;
+        let fft_radix2_pipeline = Self::create_pipeline(&device, &library, "circle_fft_radix2")?;
+        let ifft_radix2_pipeline = Self::create_pipeline(&device, &library, "circle_ifft_radix2")?;
         let fri_fold_circle_pipeline =
             Self::create_pipeline(&device, &library, "fri_fold_circle")?;
         let fri_fold_line_pipeline = Self::create_pipeline(&device, &library, "fri_fold_line")?;
@@ -101,6 +109,8 @@ impl MetalContext {
             library,
             fft_radix8_pipeline,
             ifft_radix8_pipeline,
+            fft_radix2_pipeline,
+            ifft_radix2_pipeline,
             fri_fold_circle_pipeline,
             fri_fold_line_pipeline,
             quotient_pipeline,
@@ -156,6 +166,16 @@ impl MetalContext {
     /// Get IFFT radix-8 pipeline.
     pub fn ifft_radix8_pipeline(&self) -> &ComputePipelineState {
         &self.ifft_radix8_pipeline
+    }
+
+    /// Get FFT radix-2 pipeline.
+    pub fn fft_radix2_pipeline(&self) -> &ComputePipelineState {
+        &self.fft_radix2_pipeline
+    }
+
+    /// Get IFFT radix-2 pipeline.
+    pub fn ifft_radix2_pipeline(&self) -> &ComputePipelineState {
+        &self.ifft_radix2_pipeline
     }
 
     /// Get FRI fold (circle) pipeline.

@@ -48,7 +48,8 @@ inline uint32_t m31_mul_twiddle_dbl(uint32_t a, uint32_t b_dbl) {
     // Since b_dbl = 2*b, product = 2*a*b
     // Shift right by 1 to get a*b, then reduce
     uint64_t shifted = product >> 1;
-    uint32_t low = uint32_t(shifted) & M31_PRIME;
+    // Extract low 31 bits and high bits properly from the 64-bit value
+    uint32_t low = uint32_t(shifted & M31_PRIME);
     uint32_t high = uint32_t(shifted >> 31);
     return m31_reduce(low + high);
 }
@@ -242,6 +243,104 @@ kernel void circle_ifft_radix8(
     data[offset + (5 << layer)] = v5;
     data[offset + (6 << layer)] = v6;
     data[offset + (7 << layer)] = v7;
+}
+
+// ============================================================================
+// Vecwise FFT Kernels (Radix-2)
+// ============================================================================
+
+/// Circle FFT Radix-2 kernel for vecwise layers (0-4).
+///
+/// Each thread processes a single butterfly (2 elements).
+/// This is used for the bottom 5 layers where elements are close together.
+///
+/// Parameters:
+/// - data: Input/output buffer
+/// - twiddles: Doubled twiddle factors for this layer
+/// - log_size: log2(FFT size)
+/// - layer: Current layer index (0-4 for vecwise)
+kernel void circle_fft_radix2(
+    device uint32_t* data [[buffer(0)]],
+    device const uint32_t* twiddles [[buffer(1)]],
+    constant uint32_t& log_size [[buffer(2)]],
+    constant uint32_t& layer [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    // Each thread processes one butterfly
+    // Stride for this layer
+    uint32_t stride = 1u << layer;
+    uint32_t pair_count = 1u << (log_size - 1);
+
+    if (gid >= pair_count) return;
+
+    // Calculate which butterfly within the block
+    uint32_t block_size = stride * 2;
+    uint32_t block_idx = gid / stride;
+    uint32_t in_block_idx = gid % stride;
+
+    // Indices of the two elements in this butterfly
+    uint32_t idx0 = block_idx * block_size + in_block_idx;
+    uint32_t idx1 = idx0 + stride;
+
+    // Load values
+    uint32_t v0 = data[idx0];
+    uint32_t v1 = data[idx1];
+
+    // Get twiddle factor for this butterfly
+    // All butterflies in the same superblock use the same twiddle
+    // The superblock index (block_idx) determines which twiddle to use
+    uint32_t twiddle_idx = block_idx;
+    uint32_t twiddle_dbl = twiddles[twiddle_idx];
+
+    // Apply butterfly
+    fft_butterfly(v0, v1, twiddle_dbl);
+
+    // Store results
+    data[idx0] = v0;
+    data[idx1] = v1;
+}
+
+/// Circle IFFT Radix-2 kernel for vecwise layers (0-4).
+///
+/// Each thread processes a single inverse butterfly (2 elements).
+kernel void circle_ifft_radix2(
+    device uint32_t* data [[buffer(0)]],
+    device const uint32_t* itwiddles [[buffer(1)]],
+    constant uint32_t& log_size [[buffer(2)]],
+    constant uint32_t& layer [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    // Each thread processes one butterfly
+    uint32_t stride = 1u << layer;
+    uint32_t pair_count = 1u << (log_size - 1);
+
+    if (gid >= pair_count) return;
+
+    // Calculate which butterfly within the block
+    uint32_t block_size = stride * 2;
+    uint32_t block_idx = gid / stride;
+    uint32_t in_block_idx = gid % stride;
+
+    // Indices of the two elements in this butterfly
+    uint32_t idx0 = block_idx * block_size + in_block_idx;
+    uint32_t idx1 = idx0 + stride;
+
+    // Load values
+    uint32_t v0 = data[idx0];
+    uint32_t v1 = data[idx1];
+
+    // Get inverse twiddle factor
+    // All butterflies in the same superblock use the same twiddle
+    // The superblock index (block_idx) determines which twiddle to use
+    uint32_t twiddle_idx = block_idx;
+    uint32_t itwiddle_dbl = itwiddles[twiddle_idx];
+
+    // Apply inverse butterfly
+    ifft_butterfly(v0, v1, itwiddle_dbl);
+
+    // Store results
+    data[idx0] = v0;
+    data[idx1] = v1;
 }
 
 // ============================================================================

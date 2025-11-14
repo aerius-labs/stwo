@@ -57,8 +57,8 @@ use crate::prover::backend::{Backend, BackendForChannel, ColumnOps};
 /// Size thresholds for GPU vs CPU dispatch.
 #[cfg(target_os = "macos")]
 pub mod thresholds {
-    /// Minimum log size for GPU FFT (temporarily lowered for testing).
-    pub const MIN_FFT_LOG_SIZE: u32 = 10;
+    /// Minimum log size for GPU FFT (lowered for debugging).
+    pub const MIN_FFT_LOG_SIZE: u32 = 5;
 
     /// Minimum log size for GPU FRI folding.
     pub const MIN_FRI_LOG_SIZE: u32 = 10;

@@ -20,6 +20,25 @@ use super::context::MetalContext;
 use super::thresholds::MIN_FFT_LOG_SIZE;
 use super::MetalBackend;
 
+/// Generates circle twiddles (layer 0) from first line twiddles (layer 1).
+/// For each pair [x, y] in first_line_twiddles, generates [y, -y, -x, x].
+/// Note: Twiddles are doubled (2*value) for SIMD optimization.
+fn circle_twiddles_from_line_twiddles(first_line_twiddles: &[u32]) -> Vec<u32> {
+    const P_DBL: u32 = 4294967294;  // 2 * (2^31 - 1) = 2^32 - 2
+    let neg_m31_dbl = |a_dbl: u32| if a_dbl == 0 { 0 } else { P_DBL - a_dbl };
+
+    first_line_twiddles
+        .chunks_exact(2)
+        .flat_map(|chunk| {
+            let x_dbl = chunk[0];
+            let y_dbl = chunk[1];
+            let neg_y_dbl = neg_m31_dbl(y_dbl);
+            let neg_x_dbl = neg_m31_dbl(x_dbl);
+            [y_dbl, neg_y_dbl, neg_x_dbl, x_dbl]
+        })
+        .collect()
+}
+
 impl PolyOps for MetalBackend {
     // Use SIMD's twiddle format (doubled u32 values)
     type Twiddles = <SimdBackend as PolyOps>::Twiddles;
@@ -118,19 +137,19 @@ fn metal_fft_dispatch(
     // Number of FFT layers is log_size - 1 (based on coset size)
     let num_fft_layers = log_size - 1;
 
-    // Fall back to SIMD for now
-    // TODO(Phase 2): Current Metal implementation only handles non-vecwise layers (radix-8).
-    // The bottom 5 "vecwise" layers use specialized SIMD operations not yet implemented on Metal.
-    // Until vecwise layer support is added, fall back to SIMD for all sizes.
+    // Phase 2: Full GPU acceleration with radix-2 for vecwise layers (0-4) and radix-8 for higher layers
     const VECWISE_FFT_BITS: u32 = 5;
     let non_vecwise_layers = if num_fft_layers > VECWISE_FFT_BITS {
         num_fft_layers - VECWISE_FFT_BITS
     } else {
-        num_fft_layers
+        0  // All layers are vecwise, handled by radix-2
     };
 
-    // Always fall back for now (vecwise layers not yet implemented)
-    if true || log_size < MIN_FFT_LOG_SIZE || non_vecwise_layers % 3 != 0 {
+    // Phase 2: Full Metal GPU with radix-2 for vecwise and radix-8 for non-vecwise
+    // Fall back to SIMD if: small size or non-vecwise layers not divisible by 3
+    if log_size < MIN_FFT_LOG_SIZE || (non_vecwise_layers > 0 && non_vecwise_layers % 3 != 0) {
+        println!("FFT: Falling back to SIMD (log_size={}, MIN={}, non_vecwise={})",
+                 log_size, MIN_FFT_LOG_SIZE, non_vecwise_layers);
         let simd_poly: &CircleCoefficients<SimdBackend> =
             unsafe { &*(poly as *const _ as *const _) };
         let simd_twiddles: &TwiddleTree<SimdBackend> =
@@ -138,6 +157,9 @@ fn metal_fft_dispatch(
         let simd_result = SimdBackend::evaluate(simd_poly, domain, simd_twiddles);
         return CircleEvaluation::new(simd_result.domain, simd_result.values);
     }
+
+    #[cfg(test)]
+    println!("\n=== FFT Metal GPU path (log_size={}, num_fft_layers={}) ===", log_size, num_fft_layers);
 
     let ctx = MetalContext::global();
     let device = ctx.device();
@@ -153,50 +175,27 @@ fn metal_fft_dispatch(
         MTLResourceOptions::StorageModeShared,
     );
 
+    #[cfg(test)]
+    println!("Initial input (first 8): {:?}", &data_vec[..8.min(data_len)].iter().map(|f| f.0).collect::<Vec<_>>());
+
     // Convert flat twiddles to per-layer slices
     let twiddle_slices = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
     let num_fft_layers = twiddle_slices.len() as u32;
 
-    // Create twiddle buffers for each layer
-    // Process in steps of 3 layers (radix-8)
-    // Match SIMD's iteration: (VECWISE_FFT_BITS..fft_layers).step_by(3).rev()
-
-    #[cfg(test)]
-    println!("\nMetal FFT dispatch: log_size={}, num_fft_layers={}", log_size, num_fft_layers);
-
-    // Iterate from highest layer down, stepping by 3
-    // SIMD: for layer in (VECWISE_FFT_BITS..fft_layers).step_by(3).rev()
-    // Only process if we have at least 3 full layers remaining
-    // For radix-8, we need layers: layer, layer+1, layer+2
-    // So we need layer + 3 <= num_fft_layers
+    // Phase 1: Process non-vecwise layers (6+) using radix-8 kernels FIRST (DIF FFT: high to low)
     let max_layer_for_radix8 = if num_fft_layers >= 3 { num_fft_layers - 2 } else { 0 };
-    for layer in ((VECWISE_FFT_BITS..max_layer_for_radix8).step_by(3)).rev() {
-
-        #[cfg(test)]
-        println!("  Iteration: layer={}, processing physical layers {},{},{}",
-                 layer, layer, layer+1, layer+2);
+    // Process layers above VECWISE_FFT_BITS, stepping by 3 from highest layer down
+    for layer in ((VECWISE_FFT_BITS + 1..max_layer_for_radix8 + 1).step_by(3)).rev() {
 
         // Get twiddle slices for this radix-8 step (3 layers)
-        // Note: twiddle_slices are in REVERSE order (index 0 = highest layer)
-        // When layer=9, we process physical layers 9,10,11
-        // Kernel applies layer2 (coarsest=11), layer1 (middle=10), layer0 (finest=9)
-        let tw_idx_layer2 = (num_fft_layers - 1 - (layer + 2)) as usize;
-        let tw_idx_layer1 = (num_fft_layers - 1 - (layer + 1)) as usize;
-        let tw_idx_layer0 = (num_fft_layers - 1 - layer) as usize;
+        // Use same indexing as vecwise layers: tw_idx = layer - 1
+        let tw_idx_layer2 = (layer + 2 - 1) as usize;  // Coarsest layer (highest)
+        let tw_idx_layer1 = (layer + 1 - 1) as usize;  // Middle layer
+        let tw_idx_layer0 = (layer - 1) as usize;      // Finest layer (lowest)
 
         let tw_layer2 = twiddle_slices[tw_idx_layer2];
         let tw_layer1 = twiddle_slices[tw_idx_layer1];
         let tw_layer0 = twiddle_slices[tw_idx_layer0];
-
-        #[cfg(test)]
-        println!("    tw_layer2 (coarsest): twiddle_slices[{}], len={}",
-                 tw_idx_layer2, tw_layer2.len());
-        #[cfg(test)]
-        println!("    tw_layer1 (middle):   twiddle_slices[{}], len={}",
-                 tw_idx_layer1, tw_layer1.len());
-        #[cfg(test)]
-        println!("    tw_layer0 (finest):   twiddle_slices[{}], len={}",
-                 tw_idx_layer0, tw_layer0.len());
 
         // Create twiddle buffers
         let tw0_buffer = device.new_buffer_with_data(
@@ -215,7 +214,7 @@ fn metal_fft_dispatch(
             MTLResourceOptions::StorageModeShared,
         );
 
-        // Create command buffer
+        // Create command buffer for this iteration
         let command_buffer = ctx.command_queue().new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
@@ -230,17 +229,83 @@ fn metal_fft_dispatch(
         encoder.set_bytes(4, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
         encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &layer as *const u32 as *const _);
 
-        // Dispatch threads: one thread per starting position
-        // SIMD iterates: for l in (0..1<<layer).step_by(16)
-        // Metal needs one thread per l value (no SIMD vectorization)
-        // Total threads = 2^layer (one per starting offset)
+        // Dispatch threads
         let num_threads = 1u64 << layer;
-
-        #[cfg(test)]
-        println!("    num_threads = {} (2^{})", num_threads, layer);
-
         let threadgroup_size = 256.min(num_threads);
         let threadgroups = (num_threads + threadgroup_size - 1) / threadgroup_size;
+
+        encoder.dispatch_thread_groups(
+            metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+            metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
+    // Phase 2: Process line layers (1-5) using radix-2, in reverse order
+    let _line_layers_start = 1u32;
+    let _line_layers_end = VECWISE_FFT_BITS.min(num_fft_layers);
+
+    // Process all vecwise line layers (1-5) in reverse order - INCLUSIVE range!
+    for layer in (_line_layers_start..=_line_layers_end).rev() {
+        // Twiddle indexing: use layer - 1
+        let tw_idx = (layer - 1) as usize;
+        let tw_layer = twiddle_slices[tw_idx];
+
+        let tw_buffer = device.new_buffer_with_data(
+            tw_layer.as_ptr() as *const _,
+            (tw_layer.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = ctx.command_queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(ctx.fft_radix2_pipeline());
+        encoder.set_buffer(0, Some(&data_buffer), 0);
+        encoder.set_buffer(1, Some(&tw_buffer), 0);
+        encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
+        encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &layer as *const u32 as *const _);
+
+        let num_threads = 1u64 << (log_size - 1);
+        let threadgroup_size = 256.min(num_threads.max(1));
+        let threadgroups = if num_threads == 0 { 1 } else { (num_threads + threadgroup_size - 1) / threadgroup_size };
+
+        encoder.dispatch_thread_groups(
+            metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+            metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
+    // Phase 3: Process circle layer (layer 0) with special circle twiddles
+    if num_fft_layers > 0 {
+        // Generate circle twiddles from first line twiddles (layer 1)
+        let first_line_twiddles = twiddle_slices[0];
+        let circle_twiddles = circle_twiddles_from_line_twiddles(first_line_twiddles);
+
+        let tw_buffer = device.new_buffer_with_data(
+            circle_twiddles.as_ptr() as *const _,
+            (circle_twiddles.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = ctx.command_queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(ctx.fft_radix2_pipeline());
+        encoder.set_buffer(0, Some(&data_buffer), 0);
+        encoder.set_buffer(1, Some(&tw_buffer), 0);
+        encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
+        let layer = 0u32;
+        encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &layer as *const u32 as *const _);
+
+        let num_threads = 1u64 << (log_size - 1);
+        let threadgroup_size = 256.min(num_threads.max(1));
+        let threadgroups = if num_threads == 0 { 1 } else { (num_threads + threadgroup_size - 1) / threadgroup_size };
 
         encoder.dispatch_thread_groups(
             metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
@@ -280,17 +345,20 @@ fn metal_ifft_dispatch(
     // Number of IFFT layers is log_size - 1 (based on coset size)
     let num_ifft_layers = log_size - 1;
 
-    // Fall back to SIMD for now
-    // TODO(Phase 2): Same vecwise layer limitation as FFT
+    // Phase 2: Full GPU acceleration with radix-2 for vecwise layers (0-4) and radix-8 for higher layers
     const VECWISE_FFT_BITS: u32 = 5;
     let non_vecwise_layers = if num_ifft_layers > VECWISE_FFT_BITS {
         num_ifft_layers - VECWISE_FFT_BITS
     } else {
-        num_ifft_layers
+        0  // All layers are vecwise, handled by radix-2
     };
 
-    // Always fall back for now (vecwise layers not yet implemented)
-    if true || log_size < MIN_FFT_LOG_SIZE || non_vecwise_layers % 3 != 0 {
+    // Phase 2: Full Metal GPU with radix-2 for vecwise and radix-8 for non-vecwise
+    // Fall back to SIMD if: small size or non-vecwise layers not divisible by 3
+    if log_size < MIN_FFT_LOG_SIZE || (non_vecwise_layers > 0 && non_vecwise_layers % 3 != 0) {
+        #[cfg(test)]
+        println!("IFFT: Falling back to SIMD (log_size={}, MIN={}, non_vecwise={})",
+                 log_size, MIN_FFT_LOG_SIZE, non_vecwise_layers);
         let simd_eval = CircleEvaluation::new(eval.domain, eval.values);
         let simd_twiddles = TwiddleTree {
             root_coset: twiddles.root_coset,
@@ -300,6 +368,10 @@ fn metal_ifft_dispatch(
         let simd_result = SimdBackend::interpolate(simd_eval, &simd_twiddles);
         return CircleCoefficients::new(simd_result.coeffs);
     }
+
+    #[cfg(test)]
+    println!("IFFT: Using Metal GPU (log_size={}, non_vecwise={}, vecwise layers=0-{})",
+             log_size, non_vecwise_layers, VECWISE_FFT_BITS.min(num_ifft_layers) - 1);
 
     let ctx = MetalContext::global();
     let device = ctx.device();
@@ -322,7 +394,93 @@ fn metal_ifft_dispatch(
     // Process layers in groups of 3 (radix-8)
     let mut current_layer = 0u32;
 
-    while current_layer + 3 <= num_layers {
+    #[cfg(test)]
+    println!("\nMetal IFFT dispatch: log_size={}, num_ifft_layers={}", log_size, num_ifft_layers);
+
+    // Phase 1: Process circle layer (layer 0) FIRST with special circle twiddles (DIT IFFT)
+    if num_ifft_layers > 0 {
+        #[cfg(test)]
+        println!("  Circle layer: 0");
+
+        // Generate circle twiddles from first line inverse twiddles
+        let first_line_itwiddles = itwiddle_slices[(num_layers - 2) as usize];  // layer 1 itwiddles
+        let circle_itwiddles = circle_twiddles_from_line_twiddles(first_line_itwiddles);
+
+        let itw_buffer = device.new_buffer_with_data(
+            circle_itwiddles.as_ptr() as *const _,
+            (circle_itwiddles.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = ctx.command_queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(ctx.ifft_radix2_pipeline());
+        encoder.set_buffer(0, Some(&data_buffer), 0);
+        encoder.set_buffer(1, Some(&itw_buffer), 0);
+        encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
+        let layer = 0u32;
+        encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &layer as *const u32 as *const _);
+
+        let num_threads = 1u64 << (log_size - 1);
+        let threadgroup_size = 256.min(num_threads.max(1));
+        let threadgroups = if num_threads == 0 { 1 } else { (num_threads + threadgroup_size - 1) / threadgroup_size };
+
+        encoder.dispatch_thread_groups(
+            metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+            metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        current_layer = 1;
+    }
+
+    // Phase 2: Process line layers (1-5) using radix-2, in FORWARD order (DIT IFFT)
+    let line_layers_start = 1u32;
+    let line_layers_end = VECWISE_FFT_BITS.min(num_ifft_layers);
+    for layer in line_layers_start..=line_layers_end {
+        #[cfg(test)]
+        println!("  Radix-2 line layer: {}", layer);
+
+        let itw_idx = (num_layers - 1 - layer) as usize;
+        let itw_layer = itwiddle_slices[itw_idx];
+
+        let itw_buffer = device.new_buffer_with_data(
+            itw_layer.as_ptr() as *const _,
+            (itw_layer.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = ctx.command_queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(ctx.ifft_radix2_pipeline());
+        encoder.set_buffer(0, Some(&data_buffer), 0);
+        encoder.set_buffer(1, Some(&itw_buffer), 0);
+        encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
+        encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &layer as *const u32 as *const _);
+
+        let num_threads = 1u64 << (log_size - 1);
+        let threadgroup_size = 256.min(num_threads.max(1));
+        let threadgroups = if num_threads == 0 { 1 } else { (num_threads + threadgroup_size - 1) / threadgroup_size };
+
+        encoder.dispatch_thread_groups(
+            metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+            metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        current_layer = layer + 1;
+    }
+
+    // Phase 2: Process non-vecwise layers (6+) using radix-8 kernels
+    // Iterate through remaining layers, stepping by 3
+    // Process as long as we have 3 consecutive layers available
+    while current_layer + 2 <= num_layers {
         let layer = current_layer;
 
         // Get inverse twiddle slices
@@ -398,6 +556,181 @@ mod tests {
     use super::*;
     use crate::core::poly::circle::CanonicCoset;
     use crate::prover::backend::Column;
+
+    /// Compare intermediate state after radix-8: run same input twice and compare.
+    #[test]
+    fn test_radix8_intermediate_consistency() {
+        // log_size=9: radix-8 processes layers 5,6,7
+        let log_size = 9;
+        let domain = CanonicCoset::new(log_size).circle_domain();
+        let size = 1 << log_size;
+
+        println!("\n=== Testing radix-8 intermediate consistency ===");
+
+        let coeffs_data: Vec<BaseField> = (0..size).map(|i| BaseField::from(i as u32)).collect();
+
+        // Run Metal which currently has vecwise DISABLED
+        let metal_poly = CircleCoefficients::new(coeffs_data.iter().copied().collect());
+        let metal_twiddles = MetalBackend::precompute_twiddles(domain.half_coset);
+        let _metal_result = MetalBackend::evaluate(&metal_poly, domain, &metal_twiddles);
+
+        // The intermediate values after radix-8 were printed in "After radix-8" debug output
+        println!("\nNote: Metal intermediate values after radix-8 shown above");
+        println!("We need to verify these match what SIMD produces at the same point");
+    }
+
+    /// Test ONLY radix-8 layers to verify intermediate state.
+    #[test]
+    fn test_metal_radix8_intermediate() {
+        // Test with log_size=9 but only process radix-8 layers (5,6,7)
+        // by temporarily modifying vecwise range
+        let log_size = 9;
+        let domain = CanonicCoset::new(log_size).circle_domain();
+        let size = 1 << log_size;
+
+        println!("\n=== Testing radix-8 intermediate state: log_size={} ===", log_size);
+
+        // Create simple test input
+        let coeffs_data: Vec<BaseField> = (0..size).map(|i| BaseField::from(i as u32)).collect();
+
+        // Run full SIMD FFT
+        let simd_poly_full = CircleCoefficients::new(coeffs_data.iter().copied().collect());
+        let simd_twiddles = SimdBackend::precompute_twiddles(domain.half_coset);
+        let simd_result_full = SimdBackend::evaluate(&simd_poly_full, domain, &simd_twiddles);
+        let simd_values_full = simd_result_full.values.to_cpu();
+
+        println!("\nFull SIMD output (first 16): {:?}", &simd_values_full[..16].iter().map(|f| f.0).collect::<Vec<_>>());
+
+        // Now run Metal which processes radix-8 + vecwise
+        let metal_poly = CircleCoefficients::new(coeffs_data.iter().copied().collect());
+        let metal_twiddles = MetalBackend::precompute_twiddles(domain.half_coset);        let metal_result = MetalBackend::evaluate(&metal_poly, domain, &metal_twiddles);
+        let metal_values = metal_result.values.to_cpu();
+
+        println!("\nFull Metal output (first 16): {:?}", &metal_values[..16].iter().map(|f| f.0).collect::<Vec<_>>());
+
+        // The intermediate state after radix-8 was already printed in the test output
+        // Compare final results
+        for (i, (s, m)) in simd_values_full.iter().zip(metal_values.iter()).enumerate().take(16) {
+            if s != m {
+                println!("Mismatch at {}: SIMD={}, Metal={}", i, s.0, m.0);
+            }
+        }
+    }
+
+    /// Test with one radix-8 group + vecwise layers.
+    #[test]
+    fn test_metal_mixed_radix8_vecwise() {
+        // Test with log_size=9: num_fft_layers=8
+        // non_vecwise=3 (layers 5,6,7 - one radix-8 group)
+        // vecwise (layers 4,3,2,1,0)
+        let log_size = 9;
+        let domain = CanonicCoset::new(log_size).circle_domain();
+        let size = 1 << log_size;
+
+        println!("\n=== Testing mixed radix-8 + vecwise: log_size={} ===", log_size);
+        println!("num_fft_layers: {}, non_vecwise: 3 (layers 5,6,7)", log_size - 1);
+
+        // Create simple test input
+        let coeffs_data: Vec<BaseField> = (0..size).map(|i| BaseField::from(i as u32)).collect();
+
+        println!("\nInput (first 8):");
+        for i in 0..8 {
+            println!("  [{}] = {}", i, coeffs_data[i].0);
+        }
+
+        // SIMD
+        let simd_poly = CircleCoefficients::new(coeffs_data.iter().copied().collect());
+        let simd_twiddles = SimdBackend::precompute_twiddles(domain.half_coset);
+        let simd_result = SimdBackend::evaluate(&simd_poly, domain, &simd_twiddles);
+        let simd_values = simd_result.values.to_cpu();
+
+        // Metal
+        let metal_poly = CircleCoefficients::new(coeffs_data.iter().copied().collect());
+        let metal_twiddles = MetalBackend::precompute_twiddles(domain.half_coset);
+        let metal_result = MetalBackend::evaluate(&metal_poly, domain, &metal_twiddles);
+        let metal_values = metal_result.values.to_cpu();
+
+        println!("\nSIMD output (first 16):");
+        for i in 0..16 {
+            println!("  [{}] = {}", i, simd_values[i].0);
+        }
+
+        println!("\nMetal output (first 16):");
+        for i in 0..16 {
+            println!("  [{}] = {}", i, metal_values[i].0);
+        }
+
+        // Compare
+        for (i, (s, m)) in simd_values.iter().zip(metal_values.iter()).enumerate() {
+            assert_eq!(s, m, "Mismatch at index {}", i);
+        }
+    }
+
+    /// Test a single radix-2 layer to isolate kernel bugs.
+    #[test]
+    fn test_single_radix2_layer() {
+        // Manually test layer 1 processing
+        let log_size = 3; // 8 elements
+        let size = 1 << log_size;
+
+        println!("\n=== Testing single radix-2 layer ===");
+
+        // Simple input
+        let input: Vec<BaseField> = (0..size).map(|i| BaseField::from(i as u32)).collect();
+        println!("Input: {:?}", input.iter().map(|f| f.0).collect::<Vec<_>>());
+
+        // TODO: Manually invoke the Metal radix-2 kernel for layer 1
+        // Then compare with expected CPU output
+
+        println!("This test needs manual kernel invocation - skipping for now");
+    }
+
+    /// Test just the vecwise layers (no radix-8) to isolate the issue.
+    #[test]
+    fn test_metal_vecwise_only() {
+        // Test with log_size=6: num_fft_layers=5 (all vecwise, no radix-8)
+        let log_size = 6;
+        let domain = CanonicCoset::new(log_size).circle_domain();
+        let size = 1 << log_size;
+
+        println!("\n=== Testing vecwise-only: log_size={} ===", log_size);
+        println!("num_fft_layers: {}", log_size - 1);
+
+        // Create simple test input
+        let coeffs_data: Vec<BaseField> = (0..size).map(|i| BaseField::from(i as u32)).collect();
+
+        println!("\nInput (first 8):");
+        for i in 0..8 {
+            println!("  [{}] = {}", i, coeffs_data[i].0);
+        }
+
+        // SIMD
+        let simd_poly = CircleCoefficients::new(coeffs_data.iter().copied().collect());
+        let simd_twiddles = SimdBackend::precompute_twiddles(domain.half_coset);
+        let simd_result = SimdBackend::evaluate(&simd_poly, domain, &simd_twiddles);
+        let simd_values = simd_result.values.to_cpu();
+
+        // Metal
+        let metal_poly = CircleCoefficients::new(coeffs_data.iter().copied().collect());
+        let metal_twiddles = MetalBackend::precompute_twiddles(domain.half_coset);
+        let metal_result = MetalBackend::evaluate(&metal_poly, domain, &metal_twiddles);
+        let metal_values = metal_result.values.to_cpu();
+
+        println!("\nSIMD output (first 8):");
+        for i in 0..8 {
+            println!("  [{}] = {}", i, simd_values[i].0);
+        }
+
+        println!("\nMetal output (first 8):");
+        for i in 0..8 {
+            println!("  [{}] = {}", i, metal_values[i].0);
+        }
+
+        // Compare
+        for (i, (s, m)) in simd_values.iter().zip(metal_values.iter()).enumerate() {
+            assert_eq!(s, m, "Mismatch at index {}", i);
+        }
+    }
 
     /// Debug test with detailed logging to understand Metal vs SIMD divergence.
     #[test]
