@@ -139,6 +139,7 @@ pub mod poseidon252 {
     impl GrindOps<Poseidon252Channel> for SimdBackend {
         fn grind(channel: &Poseidon252Channel, pow_bits: u32) -> u64 {
             let digest = channel.digest();
+            #[cfg_attr(not(feature = "parallel"), allow(unused_variables))]
             let prefixed_digest = poseidon_hash_many(&[
                 Poseidon252Channel::POW_PREFIX.into(),
                 digest,

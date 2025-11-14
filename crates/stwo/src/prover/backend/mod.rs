@@ -1,6 +1,8 @@
 use std::fmt::Debug;
 
 pub use cpu::CpuBackend;
+#[cfg(all(target_os = "macos", feature = "metal_prover"))]
+pub use metal::MetalBackend;
 
 use crate::core::channel::MerkleChannel;
 use crate::core::fields::m31::BaseField;
@@ -14,6 +16,8 @@ use crate::prover::{AccumulationOps, QuotientOps};
 
 pub mod cpu;
 pub mod simd;
+#[cfg(all(target_os = "macos", feature = "metal_prover"))]
+pub mod metal;
 
 pub trait Backend:
     Copy
