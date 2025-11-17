@@ -65,6 +65,7 @@ block = "0.1"
 [dev-dependencies]
 aligned = "0.4.2"
 test-log = { version = "0.2.15", features = ["trace"] }
+stwo-constraint-framework = { path = "../constraint-framework" }
 
 [target.'cfg(all(target_family = "wasm", not(target_os = "wasi")))'.dev-dependencies]
 wasm-bindgen-test = "0.3.43"

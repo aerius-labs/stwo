@@ -17,8 +17,12 @@ inline uint32_t m31_reduce(uint32_t x) {
     // Since 2^31 ≡ 1 (mod 2^31 - 1), we can reduce by:
     // x = (x & M31_PRIME) + (x >> 31)
     uint32_t reduced = (x & M31_PRIME) + (x >> 31);
-    // May need one more reduction if reduced == M31_PRIME
-    return reduced == M31_PRIME ? 0 : reduced;
+    // May need one more reduction if reduced >= M31_PRIME
+    // This can happen when x >> 31 == 1 and (x & M31_PRIME) == M31_PRIME
+    if (reduced >= M31_PRIME) {
+        reduced -= M31_PRIME;
+    }
+    return reduced;
 }
 
 /// Add two M31 field elements.
@@ -54,6 +58,154 @@ inline uint32_t m31_mul_twiddle_dbl(uint32_t a, uint32_t b_dbl) {
     return m31_reduce(low + high);
 }
 
+/// Square M31 element: v^2
+inline uint32_t m31_square(uint32_t v) {
+    return m31_mul(v, v);
+}
+
+/// Compute v^(2^n) by repeated squaring
+inline uint32_t m31_sqn(uint32_t v, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        v = m31_square(v);
+    }
+    return v;
+}
+
+/// Compute M31 multiplicative inverse using optimized exponentiation chain.
+/// Computes v^(p-2) = v^(2^31 - 3) using only 37 multiplications.
+/// Algorithm from addchain optimization for Mersenne-31 field.
+inline uint32_t m31_inverse(uint32_t v) {
+    // Optimized addition chain for computing v^(2^31 - 3)
+    uint32_t t0 = m31_mul(m31_sqn(v, 2), v);           // v^(2^2) * v = v^5
+    uint32_t t1 = m31_mul(m31_sqn(t0, 1), t0);         // v^10 * v^5 = v^15
+    uint32_t t2 = m31_mul(m31_sqn(t1, 3), t0);         // v^120 * v^5 = v^125
+    uint32_t t3 = m31_mul(m31_sqn(t2, 1), t0);         // v^250 * v^5 = v^255
+    uint32_t t4 = m31_mul(m31_sqn(t3, 8), t3);         // v^(255*256) * v^255 = v^65535
+    uint32_t t5 = m31_mul(m31_sqn(t4, 8), t3);         // v^(65535*256) * v^255 = v^16777215
+    return m31_mul(m31_sqn(t5, 7), t2);                // v^(16777215*128) * v^125 = v^(2^31-3)
+}
+
+// ============================================================================
+// CM31 and QM31 Field Arithmetic (Complex and Secure Fields)
+// ============================================================================
+
+/// CM31: Complex extension of M31, represented as a + bi where i^2 = -1
+struct CM31 {
+    uint32_t a;  // Real part
+    uint32_t b;  // Imaginary part
+};
+
+/// QM31: Quadratic extension of CM31, the secure field
+/// Represented as (a+bi) + (c+di)u where u^2 = 2+i
+struct QM31 {
+    CM31 c0;  // First CM31 component (a+bi)
+    CM31 c1;  // Second CM31 component (c+di)
+};
+
+/// Add two CM31 elements
+inline CM31 cm31_add(CM31 x, CM31 y) {
+    return CM31{m31_add(x.a, y.a), m31_add(x.b, y.b)};
+}
+
+/// Subtract two CM31 elements
+inline CM31 cm31_sub(CM31 x, CM31 y) {
+    return CM31{m31_sub(x.a, y.a), m31_sub(x.b, y.b)};
+}
+
+/// Multiply two CM31 elements: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+inline CM31 cm31_mul(CM31 x, CM31 y) {
+    uint32_t real = m31_sub(m31_mul(x.a, y.a), m31_mul(x.b, y.b));
+    uint32_t imag = m31_add(m31_mul(x.a, y.b), m31_mul(x.b, y.a));
+    return CM31{real, imag};
+}
+
+/// Multiply CM31 by a doubled twiddle (for optimization)
+inline CM31 cm31_mul_twiddle_dbl(CM31 x, CM31 y_dbl) {
+    uint32_t real = m31_sub(m31_mul_twiddle_dbl(x.a, y_dbl.a), m31_mul_twiddle_dbl(x.b, y_dbl.b));
+    uint32_t imag = m31_add(m31_mul_twiddle_dbl(x.a, y_dbl.b), m31_mul_twiddle_dbl(x.b, y_dbl.a));
+    return CM31{real, imag};
+}
+
+/// Add two QM31 elements
+inline QM31 qm31_add(QM31 x, QM31 y) {
+    return QM31{cm31_add(x.c0, y.c0), cm31_add(x.c1, y.c1)};
+}
+
+/// Subtract two QM31 elements
+inline QM31 qm31_sub(QM31 x, QM31 y) {
+    return QM31{cm31_sub(x.c0, y.c0), cm31_sub(x.c1, y.c1)};
+}
+
+/// Multiply two QM31 elements
+/// (a + bu)(c + du) = (ac + R·bd) + (ad + bc)u where R = 2+i
+inline QM31 qm31_mul(QM31 x, QM31 y) {
+    // R = 2 + i
+    const CM31 R = {2, 1};
+
+    // ac + R·bd
+    CM31 ac = cm31_mul(x.c0, y.c0);
+    CM31 bd = cm31_mul(x.c1, y.c1);
+    CM31 R_bd = cm31_mul(R, bd);
+    CM31 c0 = cm31_add(ac, R_bd);
+
+    // ad + bc
+    CM31 ad = cm31_mul(x.c0, y.c1);
+    CM31 bc = cm31_mul(x.c1, y.c0);
+    CM31 c1 = cm31_add(ad, bc);
+
+    return QM31{c0, c1};
+}
+
+/// Multiply QM31 by a scalar (broadcast to all components)
+inline QM31 qm31_mul_scalar(QM31 x, QM31 alpha) {
+    return qm31_mul(x, alpha);
+}
+
+/// Create CM31 from BaseField (M31) value
+inline CM31 cm31_from_m31(uint32_t x) {
+    return CM31{x, 0};
+}
+
+/// Create zero QM31
+inline QM31 qm31_zero() {
+    return QM31{CM31{0, 0}, CM31{0, 0}};
+}
+
+/// Multiply QM31 by BaseField (M31) scalar
+inline QM31 qm31_mul_m31(QM31 x, uint32_t scalar) {
+    return QM31{
+        CM31{m31_mul(x.c0.a, scalar), m31_mul(x.c0.b, scalar)},
+        CM31{m31_mul(x.c1.a, scalar), m31_mul(x.c1.b, scalar)}
+    };
+}
+
+/// Multiply QM31 by CM31
+/// (c0 + c1*u) * cm31 = (c0 * cm31) + (c1 * cm31)*u
+inline QM31 qm31_mul_cm31(QM31 x, CM31 y) {
+    return QM31{cm31_mul(x.c0, y), cm31_mul(x.c1, y)};
+}
+
+/// Compute CM31 inverse using extended Euclidean algorithm
+/// For a + bi, inverse is (a - bi) / (a^2 + b^2)
+inline CM31 cm31_inverse(CM31 x) {
+    // Compute norm: a^2 + b^2
+    uint32_t a_sq = m31_mul(x.a, x.a);
+    uint32_t b_sq = m31_mul(x.b, x.b);
+    uint32_t norm = m31_add(a_sq, b_sq);
+
+    // Compute inverse of norm
+    uint32_t norm_inv = m31_inverse(norm);
+
+    // Compute conjugate: (a - bi)
+    uint32_t neg_b = m31_sub(0, x.b);
+
+    // Multiply conjugate by inverse of norm
+    return CM31{
+        m31_mul(x.a, norm_inv),
+        m31_mul(neg_b, norm_inv)
+    };
+}
+
 // ============================================================================
 // FFT Butterfly Operations
 // ============================================================================
@@ -86,6 +238,387 @@ inline void ifft_butterfly(
     v1 = prod;
 }
 
+/// QM31 inverse butterfly for FRI folding
+/// Computes: (v0 + v1, (v0 - v1) * t) for SecureField elements
+inline void qm31_ifft_butterfly(
+    thread QM31& v0,
+    thread QM31& v1,
+    uint32_t twiddle_dbl
+) {
+    QM31 sum = qm31_add(v0, v1);
+    QM31 diff = qm31_sub(v0, v1);
+
+    // Multiply diff by M31 twiddle applied to all 4 components
+    // diff = (c0.a + c0.b*i) + (c1.a + c1.b*i)*u
+    // Each M31 component is multiplied by the same M31 twiddle
+    QM31 prod;
+    prod.c0.a = m31_mul_twiddle_dbl(diff.c0.a, twiddle_dbl);
+    prod.c0.b = m31_mul_twiddle_dbl(diff.c0.b, twiddle_dbl);
+    prod.c1.a = m31_mul_twiddle_dbl(diff.c1.a, twiddle_dbl);
+    prod.c1.b = m31_mul_twiddle_dbl(diff.c1.b, twiddle_dbl);
+
+    v0 = sum;
+    v1 = prod;
+}
+
+// ============================================================================
+// BLAKE2s Hashing
+// ============================================================================
+
+// BLAKE2s initialization vectors
+constant uint32_t BLAKE2S_IV[8] = {
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+};
+
+// Precomputed initial state for Merkle tree nodes
+// This is the state after compressing the NODE_PREFIX ("node" + zeros)
+constant uint32_t BLAKE2S_NODE_INITIAL_STATE[8] = {
+    0xe5cf8926, 0x841cea30, 0x7b4acada, 0xfc5d8d28,
+    0xfc6ef857, 0xb29da528, 0xc0d319c7, 0x8ae795c8
+};
+
+// BLAKE2s message permutation schedule (SIGMA)
+constant uint8_t BLAKE2S_SIGMA[10][16] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+    {11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4},
+    {7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8},
+    {9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13},
+    {2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9},
+    {12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11},
+    {13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10},
+    {6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5},
+    {10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0}
+};
+
+/// Rotate right (bitwise rotation)
+inline uint32_t rotate_right(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+/// BLAKE2s mixing function G
+/// Mixes four words in the state using two message words
+inline void blake2s_g(
+    thread uint32_t& a, thread uint32_t& b,
+    thread uint32_t& c, thread uint32_t& d,
+    uint32_t x, uint32_t y
+) {
+    a = a + b + x;
+    d = rotate_right(d ^ a, 16u);
+    c = c + d;
+    b = rotate_right(b ^ c, 12u);
+    a = a + b + y;
+    d = rotate_right(d ^ a, 8u);
+    c = c + d;
+    b = rotate_right(b ^ c, 7u);
+}
+
+/// BLAKE2s compression function
+/// Compresses a 64-byte block into the 32-byte state
+inline void blake2s_compress(
+    thread uint32_t state[8],
+    thread const uint32_t* message,
+    uint32_t t0,  // Counter low word
+    uint32_t t1,  // Counter high word
+    bool is_last  // Last block flag
+) {
+    uint32_t v[16];
+
+    // Initialize working variables
+    for (int i = 0; i < 8; i++) {
+        v[i] = state[i];
+        v[i + 8] = BLAKE2S_IV[i];
+    }
+
+    // Mix counter into v[12:13]
+    v[12] ^= t0;
+    v[13] ^= t1;
+
+    // Invert v[14] if last block
+    if (is_last) {
+        v[14] = ~v[14];
+    }
+
+    // 10 rounds of mixing
+    for (int round = 0; round < 10; round++) {
+        // Column step
+        blake2s_g(v[0], v[4], v[8],  v[12], message[BLAKE2S_SIGMA[round][0]], message[BLAKE2S_SIGMA[round][1]]);
+        blake2s_g(v[1], v[5], v[9],  v[13], message[BLAKE2S_SIGMA[round][2]], message[BLAKE2S_SIGMA[round][3]]);
+        blake2s_g(v[2], v[6], v[10], v[14], message[BLAKE2S_SIGMA[round][4]], message[BLAKE2S_SIGMA[round][5]]);
+        blake2s_g(v[3], v[7], v[11], v[15], message[BLAKE2S_SIGMA[round][6]], message[BLAKE2S_SIGMA[round][7]]);
+
+        // Diagonal step
+        blake2s_g(v[0], v[5], v[10], v[15], message[BLAKE2S_SIGMA[round][8]],  message[BLAKE2S_SIGMA[round][9]]);
+        blake2s_g(v[1], v[6], v[11], v[12], message[BLAKE2S_SIGMA[round][10]], message[BLAKE2S_SIGMA[round][11]]);
+        blake2s_g(v[2], v[7], v[8],  v[13], message[BLAKE2S_SIGMA[round][12]], message[BLAKE2S_SIGMA[round][13]]);
+        blake2s_g(v[3], v[4], v[9],  v[14], message[BLAKE2S_SIGMA[round][14]], message[BLAKE2S_SIGMA[round][15]]);
+    }
+
+    // Finalization: XOR the two halves
+    for (int i = 0; i < 8; i++) {
+        state[i] ^= v[i] ^ v[i + 8];
+    }
+}
+
+/// Initialize BLAKE2s state for standard hashing (32-byte output)
+inline void blake2s_init(thread uint32_t state[8]) {
+    for (int i = 0; i < 8; i++) {
+        state[i] = BLAKE2S_IV[i];
+    }
+    // XOR first word with parameter block: hash_length=32, key_length=0
+    state[0] ^= 0x01010020;
+}
+
+/// Reduce BLAKE2s hash output modulo M31 for each u32
+inline void blake2s_reduce_m31(thread uint32_t hash[8]) {
+    for (int i = 0; i < 8; i++) {
+        hash[i] = m31_reduce(hash[i]);
+    }
+}
+
+/// IFFT normalization kernel: multiply all elements by 1/N.
+///
+/// After inverse FFT, we need to normalize by dividing by domain size.
+/// Each thread processes one M31 element.
+kernel void ifft_normalize_m31(
+    device uint32_t* data [[buffer(0)]],
+    constant uint32_t& n_inv [[buffer(1)]],
+    constant uint32_t& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) return;
+
+    uint32_t val = data[gid];
+    data[gid] = m31_mul(val, n_inv);
+}
+
+/// Fused vecwise FFT kernel for layers 1-4.
+///
+/// Processes 4 consecutive radix-2 layers in a single kernel using threadgroup memory.
+/// This eliminates the overhead of multiple kernel launches and memory round-trips.
+/// Each threadgroup processes a contiguous block of data through all 4 layers.
+/// IMPORTANT: Layers are processed in REVERSE order (4→3→2→1) to match FFT algorithm.
+kernel void circle_fft_vecwise_fused(
+    device uint32_t* data [[buffer(0)]],
+    device const uint32_t* twiddles_layer1 [[buffer(1)]],
+    device const uint32_t* twiddles_layer2 [[buffer(2)]],
+    device const uint32_t* twiddles_layer3 [[buffer(3)]],
+    device const uint32_t* twiddles_layer4 [[buffer(4)]],
+    constant uint32_t& log_size [[buffer(5)]],
+    uint gid [[thread_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]]
+) {
+    // Process layers in REVERSE order (4, 3, 2, 1) as required by FFT algorithm
+    // Each layer has different stride and butterfly patterns
+
+    // Layer 4: stride = 16
+    {
+        uint32_t stride = 16;
+        uint32_t pair_count = 1u << (log_size - 1);
+
+        if (gid < pair_count) {
+            uint32_t block_size = stride * 2;
+            uint32_t block_idx = gid / stride;
+            uint32_t in_block_idx = gid % stride;
+
+            uint32_t idx0 = block_idx * block_size + in_block_idx;
+            uint32_t idx1 = idx0 + stride;
+
+            uint32_t v0 = data[idx0];
+            uint32_t v1 = data[idx1];
+
+            uint32_t twiddle_dbl = twiddles_layer4[block_idx];
+            fft_butterfly(v0, v1, twiddle_dbl);
+
+            data[idx0] = v0;
+            data[idx1] = v1;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Layer 3: stride = 8
+    {
+        uint32_t stride = 8;
+        uint32_t pair_count = 1u << (log_size - 1);
+
+        if (gid < pair_count) {
+            uint32_t block_size = stride * 2;
+            uint32_t block_idx = gid / stride;
+            uint32_t in_block_idx = gid % stride;
+
+            uint32_t idx0 = block_idx * block_size + in_block_idx;
+            uint32_t idx1 = idx0 + stride;
+
+            uint32_t v0 = data[idx0];
+            uint32_t v1 = data[idx1];
+
+            uint32_t twiddle_dbl = twiddles_layer3[block_idx];
+            fft_butterfly(v0, v1, twiddle_dbl);
+
+            data[idx0] = v0;
+            data[idx1] = v1;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Layer 2: stride = 4
+    {
+        uint32_t stride = 4;
+        uint32_t pair_count = 1u << (log_size - 1);
+
+        if (gid < pair_count) {
+            uint32_t block_size = stride * 2;
+            uint32_t block_idx = gid / stride;
+            uint32_t in_block_idx = gid % stride;
+
+            uint32_t idx0 = block_idx * block_size + in_block_idx;
+            uint32_t idx1 = idx0 + stride;
+
+            uint32_t v0 = data[idx0];
+            uint32_t v1 = data[idx1];
+
+            uint32_t twiddle_dbl = twiddles_layer2[block_idx];
+            fft_butterfly(v0, v1, twiddle_dbl);
+
+            data[idx0] = v0;
+            data[idx1] = v1;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Layer 1: stride = 2
+    {
+        uint32_t stride = 2;
+        uint32_t pair_count = 1u << (log_size - 1);
+
+        if (gid < pair_count) {
+            uint32_t block_size = stride * 2;
+            uint32_t block_idx = gid / stride;
+            uint32_t in_block_idx = gid % stride;
+
+            uint32_t idx0 = block_idx * block_size + in_block_idx;
+            uint32_t idx1 = idx0 + stride;
+
+            uint32_t v0 = data[idx0];
+            uint32_t v1 = data[idx1];
+
+            uint32_t twiddle_dbl = twiddles_layer1[block_idx];
+            fft_butterfly(v0, v1, twiddle_dbl);
+
+            data[idx0] = v0;
+            data[idx1] = v1;
+        }
+    }
+}
+
+// ============================================================================
+// FRI Folding Kernels
+// ============================================================================
+
+/// FRI fold_line kernel
+/// Folds a line evaluation in half using inverse butterflies and alpha combination
+/// Output: val0 + alpha * val1
+///
+/// Parameters:
+/// - input: Input SecureField values (length N)
+/// - output: Output SecureField values (length N/2)
+/// - itwiddles: Inverse twiddles for the line domain (length N/2, doubled)
+/// - alpha: SecureField folding parameter
+/// - log_size: log2(N)
+kernel void fri_fold_line(
+    device const QM31* input [[buffer(0)]],
+    device QM31* output [[buffer(1)]],
+    device const uint32_t* itwiddles [[buffer(2)]],
+    constant QM31& alpha [[buffer(3)]],
+    constant uint32_t& log_size [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint32_t n_half = 1u << (log_size - 1);
+    if (tid >= n_half) return;
+
+    // Load pair of values
+    QM31 val0 = input[tid * 2];
+    QM31 val1 = input[tid * 2 + 1];
+
+    // Apply inverse butterfly with M31 twiddle (doubled)
+    uint32_t twiddle_dbl = itwiddles[tid];
+    qm31_ifft_butterfly(val0, val1, twiddle_dbl);
+
+    // Combine: val0 + alpha * val1
+    QM31 result = qm31_add(val0, qm31_mul(alpha, val1));
+
+    output[tid] = result;
+}
+
+/// FRI fold_circle_into_line kernel
+/// Folds circle domain values into line domain and accumulates
+///
+/// Parameters:
+/// - src: Source circle evaluation (SecureField, length N)
+/// - dst: Destination line evaluation (SecureField, length N/2) - accumulated into
+/// - itwiddles: Inverse twiddles for line domain (layer 1 twiddles, doubled)
+/// - alpha: SecureField folding parameter
+/// - alpha_sq: alpha^2 (precomputed)
+/// - log_size: log2(N)
+kernel void fri_fold_circle_into_line(
+    device const QM31* src [[buffer(0)]],
+    device QM31* dst [[buffer(1)]],
+    device const uint32_t* itwiddles [[buffer(2)]],
+    constant QM31& alpha [[buffer(3)]],
+    constant QM31& alpha_sq [[buffer(4)]],
+    constant uint32_t& log_size [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint32_t n_half = 1u << (log_size - 1);
+    if (tid >= n_half) return;
+
+    // Load pair of values from circle domain
+    QM31 val0 = src[tid * 2];
+    QM31 val1 = src[tid * 2 + 1];
+
+    // Compute layer 0 twiddle from layer 1 twiddles (same as compute_first_twiddles)
+    // Layer 0 pattern: [y, -y, -x, x] from layer 1 [x, y]
+    // For thread tid:
+    //   k = tid / 4 (group index)
+    //   offset = tid % 4 (position in group)
+    //   Layer 1 twiddles at [2k, 2k+1] are [x, y]
+    //   Layer 0 twiddle depends on offset:
+    //     0 -> y, 1 -> -y, 2 -> -x, 3 -> x
+    uint32_t k = tid / 4;
+    uint32_t offset = tid % 4;
+
+    // Doubled prime for negation (P*2 = (2^31 - 1) * 2 = 2^32 - 2)
+    const uint32_t P2 = 0xFFFFFFFE;
+    uint32_t twiddle_dbl;
+
+    if (offset == 0) {
+        // y (no negation)
+        twiddle_dbl = itwiddles[2 * k + 1];
+    } else if (offset == 1) {
+        // -y (negate)
+        twiddle_dbl = itwiddles[2 * k + 1] ^ P2;
+    } else if (offset == 2) {
+        // -x (negate)
+        twiddle_dbl = itwiddles[2 * k] ^ P2;
+    } else {
+        // x (no negation)
+        twiddle_dbl = itwiddles[2 * k];
+    }
+
+    // Apply inverse butterfly with layer 0 twiddle (doubled)
+    qm31_ifft_butterfly(val0, val1, twiddle_dbl);
+
+    // Combine: val0 + alpha * val1
+    QM31 folded = qm31_add(val0, qm31_mul(alpha, val1));
+
+    // Accumulate into dst: dst[tid] = dst[tid] * alpha^2 + folded
+    QM31 prev = dst[tid];
+    QM31 scaled = qm31_mul(prev, alpha_sq);
+    dst[tid] = qm31_add(scaled, folded);
+}
+
 // ============================================================================
 // FFT Kernels
 // ============================================================================
@@ -109,16 +642,21 @@ kernel void circle_fft_radix8(
     device const uint32_t* twiddles_layer2 [[buffer(3)]],
     constant uint32_t& log_size [[buffer(4)]],
     constant uint32_t& layer [[buffer(5)]],
+    constant uint32_t& tw0_len [[buffer(6)]],
+    constant uint32_t& tw1_len [[buffer(7)]],
+    constant uint32_t& tw2_len [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ) {
     // Each thread processes 8 elements with stride 2^layer
-    // Thread gid processes starting position gid
-    uint32_t offset = gid;
+    // Data is divided into blocks of size 2^(layer+3)
+    // Thread gid is decomposed into: block_idx (which block) and in_block_idx (position within block)
     uint32_t stride = 1u << layer;
+    uint32_t block_idx = gid >> layer;  // Which block of size 2^(layer+3)
+    uint32_t in_block_idx = gid & ((1u << layer) - 1);  // Position within the block
+    uint32_t offset = (block_idx << (layer + 3)) + in_block_idx;
 
-    // Compute index for twiddle lookup (which block of size 2^(layer+3) we're in)
-    // SIMD uses: offset = index << (layer + 3), so index = position >> (layer + 3)
-    uint32_t index = gid >> (layer + 3);
+    // Twiddle index is just the block index
+    uint32_t index = block_idx;
 
     // Load 8 elements with stride (matching SIMD fft3 implementation)
     uint32_t v0 = data[offset + (0 << layer)];
@@ -131,31 +669,32 @@ kernel void circle_fft_radix8(
     uint32_t v7 = data[offset + (7 << layer)];
 
     // Layer 2: 4 butterflies (coarsest, stride = 4)
-    // SIMD uses: twiddle_dbl[2][(index + i) & mask]
-    // Twiddle array has length 2^(layer+2), mask is 2^(layer+2) - 1
-    uint32_t tw2 = twiddles_layer2[index & ((1u << (layer + 2)) - 1)];
+    // SIMD uses: twiddle_dbl[2][(index + i) & (len - 1)]
+    // Use actual buffer length for mask (not layer-based formula)
+    uint32_t tw2_mask = tw2_len - 1;
+    uint32_t tw2 = twiddles_layer2[index & tw2_mask];
     fft_butterfly(v0, v4, tw2);
     fft_butterfly(v1, v5, tw2);
     fft_butterfly(v2, v6, tw2);
     fft_butterfly(v3, v7, tw2);
 
     // Layer 1: 4 butterflies (middle, stride = 2)
-    // SIMD uses: twiddle_dbl[1][(index * 2 + i) & mask]
-    // Twiddle array has length 2^(layer+1), mask is 2^(layer+1) - 1
-    uint32_t tw1_0 = twiddles_layer1[(index * 2 + 0) & ((1u << (layer + 1)) - 1)];
-    uint32_t tw1_1 = twiddles_layer1[(index * 2 + 1) & ((1u << (layer + 1)) - 1)];
+    // SIMD uses: twiddle_dbl[1][(index * 2 + i) & (len - 1)]
+    uint32_t tw1_mask = tw1_len - 1;
+    uint32_t tw1_0 = twiddles_layer1[(index * 2 + 0) & tw1_mask];
+    uint32_t tw1_1 = twiddles_layer1[(index * 2 + 1) & tw1_mask];
     fft_butterfly(v0, v2, tw1_0);
     fft_butterfly(v1, v3, tw1_0);
     fft_butterfly(v4, v6, tw1_1);
     fft_butterfly(v5, v7, tw1_1);
 
     // Layer 0: 4 butterflies (finest, stride = 1)
-    // SIMD uses: twiddle_dbl[0][(index * 4 + i) & mask]
-    // Twiddle array has length 2^layer, mask is 2^layer - 1
-    uint32_t tw0_0 = twiddles_layer0[(index * 4 + 0) & ((1u << layer) - 1)];
-    uint32_t tw0_1 = twiddles_layer0[(index * 4 + 1) & ((1u << layer) - 1)];
-    uint32_t tw0_2 = twiddles_layer0[(index * 4 + 2) & ((1u << layer) - 1)];
-    uint32_t tw0_3 = twiddles_layer0[(index * 4 + 3) & ((1u << layer) - 1)];
+    // SIMD uses: twiddle_dbl[0][(index * 4 + i) & (len - 1)]
+    uint32_t tw0_mask = tw0_len - 1;
+    uint32_t tw0_0 = twiddles_layer0[(index * 4 + 0) & tw0_mask];
+    uint32_t tw0_1 = twiddles_layer0[(index * 4 + 1) & tw0_mask];
+    uint32_t tw0_2 = twiddles_layer0[(index * 4 + 2) & tw0_mask];
+    uint32_t tw0_3 = twiddles_layer0[(index * 4 + 3) & tw0_mask];
     fft_butterfly(v0, v1, tw0_0);
     fft_butterfly(v2, v3, tw0_1);
     fft_butterfly(v4, v5, tw0_2);
@@ -186,12 +725,15 @@ kernel void circle_ifft_radix8(
     uint gid [[thread_position_in_grid]]
 ) {
     // Each thread processes 8 elements with stride 2^layer
-    // Thread gid processes starting position gid
-    uint32_t offset = gid;
+    // Data is divided into blocks of size 2^(layer+3)
+    // Thread gid is decomposed into: block_idx (which block) and in_block_idx (position within block)
     uint32_t stride = 1u << layer;
+    uint32_t block_idx = gid >> layer;  // Which block of size 2^(layer+3)
+    uint32_t in_block_idx = gid & ((1u << layer) - 1);  // Position within the block
+    uint32_t offset = (block_idx << (layer + 3)) + in_block_idx;
 
-    // Compute index for twiddle lookup (which block of size 2^(layer+3) we're in)
-    uint32_t index = gid >> (layer + 3);
+    // Twiddle index is just the block index
+    uint32_t index = block_idx;
 
     // Load 8 elements with stride (matching SIMD ifft3 implementation)
     uint32_t v0 = data[offset + (0 << layer)];
@@ -344,73 +886,295 @@ kernel void circle_ifft_radix2(
 }
 
 // ============================================================================
-// FRI Kernels
-// ============================================================================
-
-/// FRI fold over circle (placeholder).
-kernel void fri_fold_circle(
-    device const uint32_t* layer_in [[buffer(0)]],
-    device uint32_t* layer_out [[buffer(1)]],
-    device const uint32_t* alpha [[buffer(2)]],
-    constant uint32_t& log_size [[buffer(3)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    // Placeholder implementation
-}
-
-/// FRI fold over line (placeholder).
-kernel void fri_fold_line(
-    device const uint32_t* layer_in [[buffer(0)]],
-    device uint32_t* layer_out [[buffer(1)]],
-    device const uint32_t* alpha [[buffer(2)]],
-    constant uint32_t& log_size [[buffer(3)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    // Placeholder implementation
-}
-
-// ============================================================================
 // Quotient Accumulation Kernels
 // ============================================================================
 
-/// Quotient accumulation kernel (placeholder).
+/// Quotient accumulation kernel.
+///
+/// Computes Q(x) = Σ_i (random_coeff^i * (P_i(x) - y_i) / (x - x_i))
+///
+/// For each domain point, accumulates quotient terms from all sample batches.
+/// Denominator inverses are computed on-the-fly using CM31 batch inversion.
+///
+/// Layout:
+/// - domain_points_x/y: Domain point coordinates (BaseField), bit-reversed order
+/// - columns: Flattened column data (BaseField values)
+/// - column_indices: Which column each line_coeff corresponds to
+/// - line_coeffs: Flattened (a, b, c) coefficients as QM31 values
+/// - sample_points_x/y: Sample point coordinates (QM31)
+/// - batch_sizes: Number of columns in each sample batch
+/// - output: Accumulated quotient (QM31)
 kernel void quotient_accumulate(
-    device const uint32_t* numerator [[buffer(0)]],
-    device const uint32_t* denominator [[buffer(1)]],
-    device uint32_t* accumulator [[buffer(2)]],
-    device const uint32_t* random_coeff [[buffer(3)]],
-    constant uint32_t& size [[buffer(4)]],
+    device const uint32_t* domain_points_x [[buffer(0)]],  // Domain X coords (M31)
+    device const uint32_t* domain_points_y [[buffer(1)]],  // Domain Y coords (M31)
+    device const uint32_t* columns [[buffer(2)]],           // All column data (M31)
+    constant uint32_t& num_columns [[buffer(3)]],           // Total number of columns
+    constant uint32_t& domain_size [[buffer(4)]],           // Size of domain
+    device const uint32_t* column_indices [[buffer(5)]],    // Column index for each coeff
+    device const QM31* line_coeffs [[buffer(6)]],           // Flattened (a,b,c) triplets
+    device const QM31* sample_points_x [[buffer(7)]],       // Sample X coords (QM31)
+    device const QM31* sample_points_y [[buffer(8)]],       // Sample Y coords (QM31)
+    device const uint32_t* batch_sizes [[buffer(9)]],       // Columns per batch
+    constant uint32_t& num_batches [[buffer(10)]],          // Number of sample batches
+    device QM31* output [[buffer(11)]],                     // Output (QM31)
     uint tid [[thread_position_in_grid]]
 ) {
-    // Placeholder implementation
+    if (tid >= domain_size) {
+        return;
+    }
+
+    // Get domain point coordinates (BaseField)
+    uint32_t domain_x = domain_points_x[tid];
+    uint32_t domain_y = domain_points_y[tid];
+
+    // Initialize accumulator
+    QM31 accumulator = qm31_zero();
+
+    // Process each sample batch
+    uint line_coeff_offset = 0;
+    for (uint batch_idx = 0; batch_idx < num_batches; batch_idx++) {
+        uint batch_size = batch_sizes[batch_idx];
+
+        // Get sample point (QM31)
+        QM31 sample_x = sample_points_x[batch_idx];
+        QM31 sample_y = sample_points_y[batch_idx];
+
+        // Compute denominator inverse
+        // denominator = (sample.x - domain.x) * sample.y.1 - (sample.y - domain.y) * sample.x.1
+        // Where sample.x = (sample.x.0, sample.x.1) in CM31
+        CM31 sample_xr = sample_x.c0;  // Real part
+        CM31 sample_xi = sample_x.c1;  // Imaginary part
+        CM31 sample_yr = sample_y.c0;
+        CM31 sample_yi = sample_y.c1;
+
+        CM31 dx = cm31_sub(sample_xr, cm31_from_m31(domain_x));
+        CM31 dy = cm31_sub(sample_yr, cm31_from_m31(domain_y));
+
+        CM31 denominator = cm31_sub(cm31_mul(dx, sample_yi), cm31_mul(dy, sample_xi));
+        CM31 denominator_inv = cm31_inverse(denominator);
+
+        // Accumulate numerator for this batch
+        QM31 numerator = qm31_zero();
+
+        for (uint col_offset = 0; col_offset < batch_size; col_offset++) {
+            uint coeff_idx = line_coeff_offset + col_offset * 3;
+            QM31 a = line_coeffs[coeff_idx + 0];
+            QM31 b = line_coeffs[coeff_idx + 1];
+            QM31 c = line_coeffs[coeff_idx + 2];
+
+            // Get column index and value
+            uint col_idx = column_indices[line_coeff_offset / 3 + col_offset];
+            uint32_t col_value = columns[col_idx * domain_size + tid];
+
+            // Compute: c * value - (a * domain_y + b)
+            QM31 c_times_value = qm31_mul_m31(c, col_value);
+            QM31 a_times_y = qm31_mul_m31(a, domain_y);
+            QM31 linear_term = qm31_add(a_times_y, b);
+            QM31 term = qm31_sub(c_times_value, linear_term);
+
+            numerator = qm31_add(numerator, term);
+        }
+
+        // Multiply numerator by denominator inverse
+        QM31 batch_contribution = qm31_mul_cm31(numerator, denominator_inv);
+        accumulator = qm31_add(accumulator, batch_contribution);
+
+        line_coeff_offset += batch_size * 3;
+    }
+
+    // Write output
+    output[tid] = accumulator;
 }
 
 // ============================================================================
 // Merkle Kernels
 // ============================================================================
 
-/// Merkle tree BLAKE2s hashing kernel (placeholder).
+/// Merkle tree internal node hashing kernel
+/// Hashes two child hashes together: parent = BLAKE2s(left || right)
+/// Each hash is 32 bytes (8 x uint32_t)
 kernel void merkle_blake2s(
-    device const uint32_t* leaves [[buffer(0)]],
-    device uint32_t* nodes [[buffer(1)]],
-    constant uint32_t& layer [[buffer(2)]],
-    constant uint32_t& log_size [[buffer(3)]],
+    device const uint32_t* children [[buffer(0)]],  // Input: child hashes (size * 2 * 8 u32s)
+    device uint32_t* parents [[buffer(1)]],          // Output: parent hashes (size * 8 u32s)
+    constant bool& is_m31_output [[buffer(2)]],     // Whether to reduce modulo M31
+    constant uint32_t& size [[buffer(3)]],          // Number of parent nodes
     uint tid [[thread_position_in_grid]]
 ) {
-    // Placeholder implementation
+    if (tid >= size) return;
+
+    // Each parent node hashes two 32-byte children
+    // Message layout: [left_hash (32 bytes), right_hash (32 bytes)] = 64 bytes = 16 u32s
+    uint32_t message[16];
+
+    // Load left child (32 bytes = 8 u32s)
+    for (int i = 0; i < 8; i++) {
+        message[i] = children[(tid * 2) * 8 + i];
+    }
+
+    // Load right child (32 bytes = 8 u32s)
+    for (int i = 0; i < 8; i++) {
+        message[8 + i] = children[(tid * 2 + 1) * 8 + i];
+    }
+
+    // Initialize BLAKE2s state with precomputed NODE_INITIAL_STATE
+    // This state is already the result of compressing the NODE_PREFIX
+    uint32_t state[8];
+    for (int i = 0; i < 8; i++) {
+        state[i] = BLAKE2S_NODE_INITIAL_STATE[i];
+    }
+
+    // Compress the 64-byte message (two child hashes)
+    // Counter is 128 because we've already processed 64 bytes (NODE_PREFIX)
+    blake2s_compress(state, message, 128, 0, true);
+
+    // Optionally reduce output modulo M31
+    if (is_m31_output) {
+        blake2s_reduce_m31(state);
+    }
+
+    // Write output hash (32 bytes = 8 u32s)
+    for (int i = 0; i < 8; i++) {
+        parents[tid * 8 + i] = state[i];
+    }
+}
+
+// ============================================================================
+// Proof-of-Work Grinding Kernels
+// ============================================================================
+
+/// Proof-of-work grinding kernel
+/// Searches for a nonce that produces a hash with at least pow_bits trailing zeros
+/// Each thread tries a range of nonces
+kernel void grind_pow(
+    device const uint32_t* digest [[buffer(0)]],     // Prefix digest (8 u32s)
+    device uint64_t* result [[buffer(1)]],           // Output: found nonce (or UINT64_MAX if not found)
+    constant uint32_t& pow_bits [[buffer(2)]],       // Required trailing zero bits
+    constant uint64_t& start_nonce [[buffer(3)]],    // Starting nonce for this batch
+    constant uint32_t& batch_size [[buffer(4)]],     // Nonces to try per thread
+    constant bool& is_m31_output [[buffer(5)]],      // Whether to reduce modulo M31
+    uint tid [[thread_position_in_grid]]
+) {
+    uint64_t base_nonce = start_nonce + tid * batch_size;
+
+    for (uint32_t i = 0; i < batch_size; i++) {
+        uint64_t nonce = base_nonce + i;
+
+        // Prepare message: digest (32 bytes) || nonce (8 bytes)
+        uint32_t message[16];
+
+        // Load digest (8 u32s = 32 bytes)
+        for (int j = 0; j < 8; j++) {
+            message[j] = digest[j];
+        }
+
+        // Add nonce (8 bytes = 2 u32s) in little-endian
+        message[8] = uint32_t(nonce);
+        message[9] = uint32_t(nonce >> 32);
+
+        // Zero-pad remaining message words
+        for (int j = 10; j < 16; j++) {
+            message[j] = 0;
+        }
+
+        // Initialize BLAKE2s state
+        uint32_t state[8];
+        blake2s_init(state);
+
+        // Compress: message is 40 bytes (digest + nonce)
+        blake2s_compress(state, message, 40, 0, true);
+
+        // Optionally reduce modulo M31
+        uint32_t hash0 = state[0];
+        if (is_m31_output) {
+            hash0 = m31_reduce(hash0);
+        }
+
+        // Count trailing zeros in first word
+        uint32_t trailing_zeros = ctz(hash0);
+
+        // Check if we found a solution
+        if (trailing_zeros >= pow_bits) {
+            // TODO(correctness): This has a race condition! Two separate atomic_fetch_min
+            // operations on low/high words are not atomic as a whole. Two threads could
+            // write inconsistent halves (e.g., low from thread A, high from thread B).
+            //
+            // Mitigation: The result is verified by verify_pow_nonce on the host, so
+            // invalid nonces from races will be rejected.
+            //
+            // Proper fix: Either use atomic_ulong (64-bit atomic) or collect multiple
+            // candidate nonces in a buffer and reduce on CPU.
+            atomic_fetch_min_explicit(
+                (device atomic_uint*)result,
+                uint(nonce),
+                memory_order_relaxed
+            );
+            // Also store high word
+            atomic_fetch_min_explicit(
+                (device atomic_uint*)(result) + 1,
+                uint(nonce >> 32),
+                memory_order_relaxed
+            );
+            return;  // Found a solution, stop searching
+        }
+    }
 }
 
 // ============================================================================
 // Lookup (MLE) Kernels
 // ============================================================================
 
-/// MLE fold kernel for GKR lookups (placeholder).
-kernel void mle_fold(
-    device const uint32_t* mle_in [[buffer(0)]],
-    device uint32_t* mle_out [[buffer(1)]],
-    device const uint32_t* challenge [[buffer(2)]],
-    constant uint32_t& log_size [[buffer(3)]],
+/// MLE fix_first_variable for BaseField → SecureField.
+/// Computes: result[i] = assignment * (input[i + midpoint] - input[i]) + input[i]
+/// Input: M31 array of length 2*N
+/// Output: QM31 array of length N
+kernel void mle_fold_m31_to_qm31(
+    device const uint32_t* input [[buffer(0)]],     // M31 values (length 2*N)
+    device QM31* output [[buffer(1)]],               // QM31 values (length N)
+    constant QM31& assignment [[buffer(2)]],         // QM31 assignment value
+    constant uint32_t& log_size [[buffer(3)]],       // log2(2*N) = log2 of input length
     uint tid [[thread_position_in_grid]]
 ) {
-    // Placeholder implementation
+    uint32_t n_half = 1u << (log_size - 1);
+    if (tid >= n_half) return;
+
+    // Read M31 values at positions i and i + n_half
+    uint32_t eval0_m31 = input[tid];
+    uint32_t eval1_m31 = input[tid + n_half];
+
+    // Convert M31 to QM31 (real part only)
+    QM31 eval0 = {{eval0_m31, 0}, {0, 0}};
+    QM31 eval1 = {{eval1_m31, 0}, {0, 0}};
+
+    // Compute: assignment * (eval1 - eval0) + eval0
+    QM31 diff = qm31_sub(eval1, eval0);
+    QM31 prod = qm31_mul(assignment, diff);
+    QM31 result = qm31_add(prod, eval0);
+
+    output[tid] = result;
+}
+
+/// MLE fix_first_variable for SecureField → SecureField.
+/// Computes: result[i] = assignment * (input[i + midpoint] - input[i]) + input[i]
+/// Input: QM31 array of length 2*N
+/// Output: QM31 array of length N
+kernel void mle_fold_qm31_to_qm31(
+    device const QM31* input [[buffer(0)]],          // QM31 values (length 2*N)
+    device QM31* output [[buffer(1)]],               // QM31 values (length N)
+    constant QM31& assignment [[buffer(2)]],         // QM31 assignment value
+    constant uint32_t& log_size [[buffer(3)]],       // log2(2*N) = log2 of input length
+    uint tid [[thread_position_in_grid]]
+) {
+    uint32_t n_half = 1u << (log_size - 1);
+    if (tid >= n_half) return;
+
+    // Read QM31 values at positions i and i + n_half
+    QM31 eval0 = input[tid];
+    QM31 eval1 = input[tid + n_half];
+
+    // Compute: assignment * (eval1 - eval0) + eval0
+    QM31 diff = qm31_sub(eval1, eval0);
+    QM31 prod = qm31_mul(assignment, diff);
+    QM31 result = qm31_add(prod, eval0);
+
+    output[tid] = result;
 }

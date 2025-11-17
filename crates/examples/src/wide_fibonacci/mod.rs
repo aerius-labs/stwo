@@ -13,8 +13,8 @@ use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval};
 pub type WideFibonacciComponent<const N: usize> = FrameworkComponent<WideFibonacciEval<N>>;
 
 pub struct FibInput {
-    a: PackedBaseField,
-    b: PackedBaseField,
+    pub a: PackedBaseField,
+    pub b: PackedBaseField,
 }
 
 /// A component that enforces the Fibonacci sequence.
@@ -284,5 +284,83 @@ mod tests {
         commitment_scheme.commit(proof.commitments[0], &sizes[0], verifier_channel);
         commitment_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
         verify(&[&component], verifier_channel, commitment_scheme, proof).unwrap();
+    }
+
+    #[test_log::test]
+    #[cfg(all(target_os = "macos", feature = "metal_prover"))]
+    fn test_wide_fib_prove_with_metal() {
+        use stwo::prover::backend::metal::MetalBackend;
+        use stwo::prover::backend::Col;
+
+        for log_n_instances in 5..=7 {
+            println!("\n=== Testing MetalBackend with log_n_instances={} ===", log_n_instances);
+
+            let config = PcsConfig::default();
+            // Precompute twiddles for Metal.
+            let twiddles = MetalBackend::precompute_twiddles(
+                CanonicCoset::new(log_n_instances + 1 + config.fri_config.log_blowup_factor)
+                    .circle_domain()
+                    .half_coset,
+            );
+
+            // Setup protocol.
+            let prover_channel = &mut Blake2sM31Channel::default();
+            let mut commitment_scheme = CommitmentSchemeProver::<
+                MetalBackend,
+                Blake2sM31MerkleChannel,
+            >::new(config, &twiddles);
+
+            // Preprocessed trace
+            let mut tree_builder = commitment_scheme.tree_builder();
+            tree_builder.extend_evals([]);
+            tree_builder.commit(prover_channel);
+
+            // Generate trace using SIMD, then convert to Metal
+            // (MetalBackend uses SIMD columns internally but is a distinct type)
+            let simd_trace = generate_test_trace(log_n_instances);
+            let metal_trace: Vec<CircleEvaluation<MetalBackend, BaseField, BitReversedOrder>> =
+                simd_trace.iter().map(|simd_eval| {
+                    let cpu_values = simd_eval.values.to_cpu();
+                    let metal_col: Col<MetalBackend, BaseField> = cpu_values.into_iter().collect();
+                    CircleEvaluation::<MetalBackend, _, BitReversedOrder>::new(simd_eval.domain, metal_col)
+                }).collect();
+
+            let mut tree_builder = commitment_scheme.tree_builder();
+            tree_builder.extend_evals(metal_trace);
+            tree_builder.commit(prover_channel);
+
+            // Prove constraints with MetalBackend.
+            let component = WideFibonacciComponent::new(
+                &mut TraceLocationAllocator::default(),
+                WideFibonacciEval::<FIB_SEQUENCE_LENGTH> {
+                    log_n_rows: log_n_instances,
+                },
+                SecureField::zero(),
+            );
+
+            println!("Proving with MetalBackend...");
+            let proof = prove::<MetalBackend, Blake2sM31MerkleChannel>(
+                &[&component],
+                prover_channel,
+                commitment_scheme,
+            )
+            .unwrap();
+
+            println!("✓ Proof generated successfully ({} bytes)", proof.commitments.len());
+
+            // Verify.
+            println!("Verifying proof...");
+            let verifier_channel = &mut Blake2sM31Channel::default();
+            let commitment_scheme =
+                &mut CommitmentSchemeVerifier::<Blake2sM31MerkleChannel>::new(config);
+
+            // Retrieve the expected column sizes in each commitment interaction, from the AIR.
+            let sizes = component.trace_log_degree_bounds();
+            commitment_scheme.commit(proof.commitments[0], &sizes[0], verifier_channel);
+            commitment_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
+            verify(&[&component], verifier_channel, commitment_scheme, proof).unwrap();
+
+            println!("✓ Proof verified successfully for log_n_instances={}", log_n_instances);
+        }
     }
 }

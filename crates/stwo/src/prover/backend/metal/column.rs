@@ -3,6 +3,12 @@
 //! These column types use `MTLStorageModeShared` which provides unified memory
 //! access on Apple Silicon - the same memory is accessible by both CPU and GPU
 //! without explicit copies.
+//!
+//! NOTE: These types are NOT used in Phase 1 (MetalBackend uses SIMD columns).
+//! They are experimental types for future Phase 2 optimization.
+
+// Allow dead code since these types are not used in Phase 1
+#[allow(dead_code)]
 
 use metal::{Buffer, MTLResourceOptions};
 use std::fmt::Debug;
@@ -10,12 +16,14 @@ use std::fmt::Debug;
 use super::context::MetalContext;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
-use crate::prover::backend::Column;
+use crate::prover::backend::{Column, CpuBackend};
+use crate::prover::secure_column::SecureColumnByCoords;
 
 /// Metal-backed column for base field elements (M31).
 ///
 /// Uses shared memory buffer accessible by both CPU and GPU.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct MetalBaseColumn {
     /// Metal buffer in shared memory.
     buffer: Buffer,
@@ -23,6 +31,7 @@ pub struct MetalBaseColumn {
     len: usize,
 }
 
+#[allow(dead_code)]
 impl MetalBaseColumn {
     /// Create a new column from a Metal buffer.
     fn from_buffer(buffer: Buffer, len: usize) -> Self {
@@ -160,6 +169,7 @@ impl FromIterator<BaseField> for MetalBaseColumn {
 /// SecureField is represented as 4 BaseField elements, so we store
 /// it as a flat buffer of BaseField elements with length 4x.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct MetalSecureColumn {
     /// Metal buffer in shared memory (stores 4 * len BaseField elements).
     buffer: Buffer,
@@ -167,6 +177,7 @@ pub struct MetalSecureColumn {
     len: usize,
 }
 
+#[allow(dead_code)]
 impl MetalSecureColumn {
     /// Create a new column from a Metal buffer.
     fn from_buffer(buffer: Buffer, len: usize) -> Self {
@@ -296,6 +307,18 @@ impl FromIterator<SecureField> for MetalSecureColumn {
         }
 
         Self::from_buffer(buffer, len)
+    }
+}
+
+// Implementation for SecureColumnByCoords
+use super::super::MetalBackend;
+
+impl SecureColumnByCoords<MetalBackend> {
+    /// Convert from CPU SecureColumnByCoords to Metal SecureColumnByCoords
+    pub fn from_cpu(cpu: SecureColumnByCoords<CpuBackend>) -> Self {
+        Self {
+            columns: cpu.columns.map(|col| col.into_iter().collect()),
+        }
     }
 }
 

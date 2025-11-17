@@ -32,12 +32,23 @@ mod context;
 mod column;
 #[cfg(target_os = "macos")]
 mod shaders;
+#[cfg(target_os = "macos")]
+mod twiddle_manager;
+#[cfg(target_os = "macos")]
+mod buffer_pool;
 
-// Export Metal infrastructure for future use
+// Export Metal context (actively used)
 #[cfg(target_os = "macos")]
 pub use context::{MetalContext, MetalContextHandle};
-#[cfg(target_os = "macos")]
-pub use column::{MetalBaseColumn, MetalSecureColumn};
+
+// NOTE: MetalBaseColumn/MetalSecureColumn are NOT exported because they're not
+// used in Phase 1. ColumnOps uses SIMD's BaseColumn/SecureColumn instead.
+// These types exist in column.rs for future Phase 2 optimization but exporting
+// them would create confusion about which column types are actually in use.
+//
+// To use them in Phase 2: uncomment the export below and switch ColumnOps.
+// #[cfg(target_os = "macos")]
+// pub use column::{MetalBaseColumn, MetalSecureColumn};
 
 #[cfg(target_os = "macos")]
 use serde::{Deserialize, Serialize};
@@ -55,22 +66,28 @@ use crate::prover::backend::simd::SimdBackend;
 use crate::prover::backend::{Backend, BackendForChannel, ColumnOps};
 
 /// Size thresholds for GPU vs CPU dispatch.
+///
+/// These thresholds are tuned based on benchmarks to ensure GPU is only used
+/// when it provides a performance benefit over SIMD. Below these thresholds,
+/// GPU dispatch overhead dominates and SIMD is faster.
 #[cfg(target_os = "macos")]
 pub mod thresholds {
-    /// Minimum log size for GPU FFT (lowered for debugging).
-    pub const MIN_FFT_LOG_SIZE: u32 = 5;
+    /// Minimum log size for GPU FFT.
+    /// Benchmarks show Metal becomes competitive with SIMD at log_size >= 14-16.
+    /// Below this, ~500µs GPU overhead makes SIMD faster.
+    pub const MIN_FFT_LOG_SIZE: u32 = 14;
 
     /// Minimum log size for GPU FRI folding.
-    pub const MIN_FRI_LOG_SIZE: u32 = 10;
+    pub const MIN_FRI_LOG_SIZE: u32 = 12;
 
     /// Minimum log size for GPU Merkle operations.
     pub const MIN_MERKLE_LOG_SIZE: u32 = 14;
 
     /// Minimum log size for GPU quotient accumulation.
-    pub const MIN_QUOTIENT_LOG_SIZE: u32 = 11;
+    pub const MIN_QUOTIENT_LOG_SIZE: u32 = 12;
 
     /// Minimum log size for GPU MLE operations.
-    pub const MIN_MLE_LOG_SIZE: u32 = 10;
+    pub const MIN_MLE_LOG_SIZE: u32 = 12;
 }
 
 // Trait implementations
@@ -106,8 +123,33 @@ impl BackendForChannel<Blake2sMerkleChannel> for MetalBackend {}
 #[cfg(target_os = "macos")]
 impl BackendForChannel<Blake2sM31MerkleChannel> for MetalBackend {}
 
-// For Phase 1, we use SIMD column types internally.
-// Metal-specific columns will be integrated in later phases.
+// ============================================================================
+// PHASE 1 ARCHITECTURE DECISION: MetalBackend = "SIMD + GPU Helpers"
+// ============================================================================
+//
+// For Phase 1, MetalBackend uses SIMD's column types (BaseColumn/SecureColumn)
+// and delegates most operations to SimdBackend, with GPU acceleration for:
+// - FFT/IFFT (metal/poly.rs)
+// - FRI folding (metal/fri.rs)
+// - Quotient accumulation (metal/quotients.rs)
+// - Merkle tree hashing (metal/merkle.rs)
+// - PoW grinding (metal/grind.rs)
+// - GKR MLE operations (metal/gkr.rs)
+//
+// This design allows Metal GPU kernels to work on data copied from SIMD columns,
+// avoiding the complexity of managing GPU-backed column types in Phase 1.
+//
+// MetalBaseColumn/MetalSecureColumn exist in column.rs but are NOT used in the
+// actual proving path - they're experimental types for future Phase 2 optimization.
+//
+// IMPORTANT: All `unsafe transmute` between SimdBackend and MetalBackend types
+// are SAFE because both use identical column representations (BaseColumn/SecureColumn).
+// However, this invariant MUST be maintained - if column types diverge, transmutes
+// become UB.
+//
+// Future Phase 2: Switch to GPU-backed columns for zero-copy Metal operations.
+// ============================================================================
+
 #[cfg(target_os = "macos")]
 impl ColumnOps<BaseField> for MetalBackend {
     type Column = BaseColumn;

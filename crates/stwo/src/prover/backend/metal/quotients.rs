@@ -5,13 +5,19 @@
 
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
-use crate::core::pcs::quotients::ColumnSampleBatch;
+use crate::core::pcs::quotients::{column_line_coeffs, ColumnSampleBatch};
 use crate::core::poly::circle::CircleDomain;
+use crate::core::utils::bit_reverse_index;
 use crate::prover::backend::simd::SimdBackend;
+use crate::prover::backend::Column;
 use crate::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
 use crate::prover::poly::BitReversedOrder;
+use crate::prover::secure_column::SecureColumnByCoords;
 use crate::prover::QuotientOps;
+use metal::MTLResourceOptions;
 
+use super::context::MetalContext;
+use super::thresholds::MIN_QUOTIENT_LOG_SIZE;
 use super::MetalBackend;
 
 impl QuotientOps for MetalBackend {
@@ -20,21 +26,210 @@ impl QuotientOps for MetalBackend {
         columns: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
         random_coeff: SecureField,
         sample_batches: &[ColumnSampleBatch],
-        log_blowup_factor: u32,
+        _log_blowup_factor: u32,
     ) -> SecureEvaluation<Self, BitReversedOrder> {
-        // TODO(Phase 3): Dispatch to Metal GPU for large quotient accumulation
-        // Transmute column slice to SIMD backend types (layout-compatible)
-        let simd_columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>] =
-            unsafe { &*(columns as *const _ as *const _) };
-        let simd_result = SimdBackend::accumulate_quotients(
-            domain,
-            simd_columns,
-            random_coeff,
-            sample_batches,
-            log_blowup_factor,
+        // Fall back to SIMD for small domains
+        if domain.log_size() < MIN_QUOTIENT_LOG_SIZE || !MetalContext::is_available() {
+            let simd_columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>] =
+                unsafe { &*(columns as *const _ as *const _) };
+            let simd_result = SimdBackend::accumulate_quotients(
+                domain,
+                simd_columns,
+                random_coeff,
+                sample_batches,
+                _log_blowup_factor,
+            );
+            return unsafe { std::mem::transmute(simd_result) };
+        }
+        let domain_size = domain.size();
+        let num_columns = columns.len();
+
+        // Precompute line coefficients (a, b, c) for each sample
+        let line_coeffs = column_line_coeffs(sample_batches, random_coeff);
+
+        // Extract domain points (x, y) in bit-reversed order
+        let mut domain_points_x = Vec::with_capacity(domain_size);
+        let mut domain_points_y = Vec::with_capacity(domain_size);
+        for i in 0..domain_size {
+            let point = domain.at(bit_reverse_index(i, domain.log_size()));
+            domain_points_x.push(point.x.0);
+            domain_points_y.push(point.y.0);
+        }
+
+        // Flatten column data (each column has domain_size M31 values)
+        let mut columns_data = Vec::with_capacity(num_columns * domain_size);
+        for col in columns {
+            let col_values: Vec<BaseField> = col.values.to_cpu().to_vec();
+            for val in col_values {
+                columns_data.push(val.0);
+            }
+        }
+
+        // Flatten line coefficients and build metadata
+        let mut line_coeffs_flat = Vec::new();
+        let mut column_indices = Vec::new();
+        let mut batch_sizes = Vec::new();
+
+        for (_batch_idx, (batch, coeffs)) in sample_batches.iter().zip(&line_coeffs).enumerate() {
+            batch_sizes.push(batch.columns_and_values.len() as u32);
+
+            for (_col_offset, ((col_idx, _), (a, b, c))) in batch
+                .columns_and_values
+                .iter()
+                .zip(coeffs.iter())
+                .enumerate()
+            {
+                column_indices.push(*col_idx as u32);
+
+                // Store (a, b, c) as QM31 values (4 components each)
+                // QM31(CM31, CM31) and CM31(M31, M31) - both tuple structs
+                // Access pattern: QM31.0 or .1 -> CM31.0 or .1 -> M31.0 -> u32
+                line_coeffs_flat.push(a.0.0.0); // a.0.0 (first CM31's first M31)
+                line_coeffs_flat.push(a.0.1.0); // a.0.1 (first CM31's second M31)
+                line_coeffs_flat.push(a.1.0.0); // a.1.0 (second CM31's first M31)
+                line_coeffs_flat.push(a.1.1.0); // a.1.1 (second CM31's second M31)
+
+                line_coeffs_flat.push(b.0.0.0); // b.0.0
+                line_coeffs_flat.push(b.0.1.0); // b.0.1
+                line_coeffs_flat.push(b.1.0.0); // b.1.0
+                line_coeffs_flat.push(b.1.1.0); // b.1.1
+
+                line_coeffs_flat.push(c.0.0.0); // c.0.0
+                line_coeffs_flat.push(c.0.1.0); // c.0.1
+                line_coeffs_flat.push(c.1.0.0); // c.1.0
+                line_coeffs_flat.push(c.1.1.0); // c.1.1
+            }
+        }
+
+        // Extract sample points (x, y)
+        let mut sample_points_x = Vec::new();
+        let mut sample_points_y = Vec::new();
+        for batch in sample_batches {
+            // sample_batch.point is CirclePoint<SecureField>
+            // SecureField = QM31(CM31, CM31), CM31(M31, M31)
+            sample_points_x.push(batch.point.x.0.0.0); // x.0.0
+            sample_points_x.push(batch.point.x.0.1.0); // x.0.1
+            sample_points_x.push(batch.point.x.1.0.0); // x.1.0
+            sample_points_x.push(batch.point.x.1.1.0); // x.1.1
+
+            sample_points_y.push(batch.point.y.0.0.0); // y.0.0
+            sample_points_y.push(batch.point.y.0.1.0); // y.0.1
+            sample_points_y.push(batch.point.y.1.0.0); // y.1.0
+            sample_points_y.push(batch.point.y.1.1.0); // y.1.1
+        }
+
+        // Dispatch to Metal GPU
+        let ctx = MetalContext::global();
+        let device = ctx.device();
+        let command_queue = ctx.command_queue();
+
+        // Create buffers
+        let domain_x_buffer = device.new_buffer_with_data(
+            domain_points_x.as_ptr() as *const _,
+            (domain_size * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
         );
 
-        // Transmute result back
-        unsafe { std::mem::transmute(simd_result) }
+        let domain_y_buffer = device.new_buffer_with_data(
+            domain_points_y.as_ptr() as *const _,
+            (domain_size * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let columns_buffer = device.new_buffer_with_data(
+            columns_data.as_ptr() as *const _,
+            (columns_data.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let column_indices_buffer = device.new_buffer_with_data(
+            column_indices.as_ptr() as *const _,
+            (column_indices.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let line_coeffs_buffer = device.new_buffer_with_data(
+            line_coeffs_flat.as_ptr() as *const _,
+            (line_coeffs_flat.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let sample_x_buffer = device.new_buffer_with_data(
+            sample_points_x.as_ptr() as *const _,
+            (sample_points_x.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let sample_y_buffer = device.new_buffer_with_data(
+            sample_points_y.as_ptr() as *const _,
+            (sample_points_y.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let batch_sizes_buffer = device.new_buffer_with_data(
+            batch_sizes.as_ptr() as *const _,
+            (batch_sizes.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Output buffer (4 u32s per QM31, domain_size elements)
+        let output_buffer = device.new_buffer(
+            (domain_size * 4 * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Dispatch kernel
+        let command_buffer = command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        let pipeline = ctx.quotient_pipeline();
+        encoder.set_compute_pipeline_state(pipeline);
+
+        encoder.set_buffer(0, Some(&domain_x_buffer), 0);
+        encoder.set_buffer(1, Some(&domain_y_buffer), 0);
+        encoder.set_buffer(2, Some(&columns_buffer), 0);
+        // Convert to u32 before passing to Metal to avoid UB from casting usize to u32 pointer
+        let num_columns_u32 = num_columns as u32;
+        encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &num_columns_u32 as *const u32 as *const _);
+        let domain_size_u32 = domain_size as u32;
+        encoder.set_bytes(4, std::mem::size_of::<u32>() as u64, &domain_size_u32 as *const u32 as *const _);
+        encoder.set_buffer(5, Some(&column_indices_buffer), 0);
+        encoder.set_buffer(6, Some(&line_coeffs_buffer), 0);
+        encoder.set_buffer(7, Some(&sample_x_buffer), 0);
+        encoder.set_buffer(8, Some(&sample_y_buffer), 0);
+        encoder.set_buffer(9, Some(&batch_sizes_buffer), 0);
+        let num_batches = sample_batches.len() as u32;
+        encoder.set_bytes(10, std::mem::size_of::<u32>() as u64, &num_batches as *const u32 as *const _);
+        encoder.set_buffer(11, Some(&output_buffer), 0);
+
+        let threadgroup_size = 256u64.min(domain_size as u64);
+        let num_threadgroups = ((domain_size as u64 + threadgroup_size - 1) / threadgroup_size).max(1);
+
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(num_threadgroups, 1, 1),
+            metal::MTLSize::new(threadgroup_size, 1, 1),
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Read output and convert to SecureColumnByCoords
+        let output_ptr = output_buffer.contents() as *const u32;
+        let output_slice = unsafe { std::slice::from_raw_parts(output_ptr, domain_size * 4) };
+
+        let mut values = unsafe { SecureColumnByCoords::<Self>::uninitialized(domain_size) };
+        for i in 0..domain_size {
+            let qm31_data = &output_slice[i * 4..(i + 1) * 4];
+            let value = SecureField::from_u32_unchecked(
+                qm31_data[0], // c0.a
+                qm31_data[1], // c0.b
+                qm31_data[2], // c1.a
+                qm31_data[3], // c1.b
+            );
+            values.set(i, value);
+        }
+
+        SecureEvaluation::new(domain, values)
     }
 }

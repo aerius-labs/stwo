@@ -9,11 +9,15 @@
 //! across threads using `MetalContextHandle`.
 
 use metal::{
-    CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLResourceOptions,
+    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library,
+    MTLResourceOptions,
 };
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::shaders;
+use super::twiddle_manager::FlatTwiddleManager;
+use super::buffer_pool::GlobalPools;
 
 /// Global Metal context singleton.
 static METAL_CONTEXT: OnceLock<Arc<MetalContext>> = OnceLock::new();
@@ -45,6 +49,12 @@ pub struct MetalContext {
     /// IFFT radix-2 kernel pipeline (for vecwise layers).
     ifft_radix2_pipeline: ComputePipelineState,
 
+    /// Fused vecwise FFT kernel pipeline (layers 1-4).
+    fft_vecwise_fused_pipeline: ComputePipelineState,
+
+    /// IFFT normalization kernel pipeline.
+    ifft_normalize_pipeline: ComputePipelineState,
+
     /// FRI fold (circle) kernel pipeline.
     fri_fold_circle_pipeline: ComputePipelineState,
 
@@ -57,8 +67,24 @@ pub struct MetalContext {
     /// Merkle BLAKE2s kernel pipeline.
     merkle_pipeline: ComputePipelineState,
 
-    /// MLE fold kernel pipeline (for lookups).
-    mle_fold_pipeline: ComputePipelineState,
+    /// MLE fold M31→QM31 kernel pipeline (for lookups).
+    mle_fold_m31_pipeline: ComputePipelineState,
+
+    /// MLE fold QM31→QM31 kernel pipeline (for lookups).
+    mle_fold_qm31_pipeline: ComputePipelineState,
+
+    /// Proof-of-work grinding kernel pipeline.
+    grind_pipeline: ComputePipelineState,
+
+    /// Cache for twiddle factor buffers.
+    /// Key is a hash of the twiddle data, value is the Metal buffer.
+    twiddle_cache: Mutex<HashMap<u64, Buffer>>,
+
+    /// Manager for flattened twiddle buffers.
+    flat_twiddle_manager: FlatTwiddleManager,
+
+    /// Global buffer pools for reusable buffers.
+    buffer_pools: GlobalPools,
 }
 
 impl MetalContext {
@@ -96,12 +122,18 @@ impl MetalContext {
         let ifft_radix8_pipeline = Self::create_pipeline(&device, &library, "circle_ifft_radix8")?;
         let fft_radix2_pipeline = Self::create_pipeline(&device, &library, "circle_fft_radix2")?;
         let ifft_radix2_pipeline = Self::create_pipeline(&device, &library, "circle_ifft_radix2")?;
+        let fft_vecwise_fused_pipeline = Self::create_pipeline(&device, &library, "circle_fft_vecwise_fused")?;
+        let ifft_normalize_pipeline = Self::create_pipeline(&device, &library, "ifft_normalize_m31")?;
         let fri_fold_circle_pipeline =
-            Self::create_pipeline(&device, &library, "fri_fold_circle")?;
+            Self::create_pipeline(&device, &library, "fri_fold_circle_into_line")?;
         let fri_fold_line_pipeline = Self::create_pipeline(&device, &library, "fri_fold_line")?;
         let quotient_pipeline = Self::create_pipeline(&device, &library, "quotient_accumulate")?;
         let merkle_pipeline = Self::create_pipeline(&device, &library, "merkle_blake2s")?;
-        let mle_fold_pipeline = Self::create_pipeline(&device, &library, "mle_fold")?;
+        let mle_fold_m31_pipeline = Self::create_pipeline(&device, &library, "mle_fold_m31_to_qm31")?;
+        let mle_fold_qm31_pipeline = Self::create_pipeline(&device, &library, "mle_fold_qm31_to_qm31")?;
+        let grind_pipeline = Self::create_pipeline(&device, &library, "grind_pow")?;
+
+        let buffer_pools = GlobalPools::new(device.clone());
 
         Ok(Self {
             device,
@@ -111,11 +143,18 @@ impl MetalContext {
             ifft_radix8_pipeline,
             fft_radix2_pipeline,
             ifft_radix2_pipeline,
+            fft_vecwise_fused_pipeline,
+            ifft_normalize_pipeline,
             fri_fold_circle_pipeline,
             fri_fold_line_pipeline,
             quotient_pipeline,
             merkle_pipeline,
-            mle_fold_pipeline,
+            mle_fold_m31_pipeline,
+            mle_fold_qm31_pipeline,
+            grind_pipeline,
+            twiddle_cache: Mutex::new(HashMap::new()),
+            flat_twiddle_manager: FlatTwiddleManager::new(),
+            buffer_pools,
         })
     }
 
@@ -178,6 +217,16 @@ impl MetalContext {
         &self.ifft_radix2_pipeline
     }
 
+    /// Get fused vecwise FFT pipeline (layers 1-4).
+    pub fn fft_vecwise_fused_pipeline(&self) -> &ComputePipelineState {
+        &self.fft_vecwise_fused_pipeline
+    }
+
+    /// Get IFFT normalization pipeline.
+    pub fn ifft_normalize_pipeline(&self) -> &ComputePipelineState {
+        &self.ifft_normalize_pipeline
+    }
+
     /// Get FRI fold (circle) pipeline.
     pub fn fri_fold_circle_pipeline(&self) -> &ComputePipelineState {
         &self.fri_fold_circle_pipeline
@@ -198,9 +247,82 @@ impl MetalContext {
         &self.merkle_pipeline
     }
 
-    /// Get MLE fold pipeline.
-    pub fn mle_fold_pipeline(&self) -> &ComputePipelineState {
-        &self.mle_fold_pipeline
+    /// Get MLE fold M31→QM31 pipeline.
+    pub fn mle_fold_m31_pipeline(&self) -> &ComputePipelineState {
+        &self.mle_fold_m31_pipeline
+    }
+
+    /// Get MLE fold QM31→QM31 pipeline.
+    pub fn mle_fold_qm31_pipeline(&self) -> &ComputePipelineState {
+        &self.mle_fold_qm31_pipeline
+    }
+
+    /// Get proof-of-work grinding pipeline.
+    pub fn grind_pipeline(&self) -> &ComputePipelineState {
+        &self.grind_pipeline
+    }
+
+    /// Get or create a flattened twiddle buffer from multiple layers.
+    /// Returns the flat buffer and section information for each layer.
+    pub fn get_or_create_flat_twiddle_buffer(
+        &self,
+        twiddle_layers: &[&[u32]],
+    ) -> super::twiddle_manager::FlatTwiddleBuffer {
+        self.flat_twiddle_manager.get_or_create_flat_buffer(&self.device, twiddle_layers)
+    }
+
+    /// Check out a shared memory buffer from the pool.
+    pub fn checkout_shared_buffer(&self, size: u64) -> super::buffer_pool::PooledBuffer {
+        self.buffer_pools.shared.checkout(size)
+    }
+
+    /// Check out a private (GPU-only) memory buffer from the pool.
+    #[allow(dead_code)]
+    pub fn checkout_private_buffer(&self, size: u64) -> super::buffer_pool::PooledBuffer {
+        self.buffer_pools.private.checkout(size)
+    }
+
+    /// Get or create a cached twiddle buffer (legacy, single layer).
+    /// Uses a simple hash of the twiddle data as the cache key.
+    pub fn get_or_create_twiddle_buffer(&self, twiddles: &[u32]) -> Buffer {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Compute a hash of the twiddle data for the cache key
+        let mut hasher = DefaultHasher::new();
+        twiddles.len().hash(&mut hasher);
+        // Sample a few twiddles for the hash (avoid hashing all for large arrays)
+        if twiddles.len() > 0 {
+            twiddles[0].hash(&mut hasher);
+            if twiddles.len() > 1 {
+                twiddles[twiddles.len() / 2].hash(&mut hasher);
+                twiddles[twiddles.len() - 1].hash(&mut hasher);
+            }
+        }
+        let cache_key = hasher.finish();
+
+        // Check cache first
+        {
+            let cache = self.twiddle_cache.lock().unwrap();
+            if let Some(buffer) = cache.get(&cache_key) {
+                return buffer.clone();
+            }
+        }
+
+        // Create new buffer if not cached
+        let buffer = self.device.new_buffer_with_data(
+            twiddles.as_ptr() as *const _,
+            (twiddles.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Store in cache
+        {
+            let mut cache = self.twiddle_cache.lock().unwrap();
+            cache.insert(cache_key, buffer.clone());
+        }
+
+        buffer
     }
 
     /// Get MTLResourceOptions for shared memory (unified memory on Apple Silicon).

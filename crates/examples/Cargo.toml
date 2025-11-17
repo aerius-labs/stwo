@@ -7,6 +7,7 @@ edition.workspace = true
 parallel = ["dep:rayon", "stwo/parallel"]
 tracing = []
 slow-tests = []
+metal_prover = ["stwo/metal_prover", "stwo-constraint-framework/metal_prover"]
 
 [lib]
 bench = false
@@ -36,3 +37,11 @@ test-log = { version = "0.2.15", features = ["trace"] }
 [[bench]]
 harness = false
 name = "poseidon"
+
+[[bench]]
+harness = false
+name = "fibonacci_metal_vs_simd"
+
+[[bench]]
+harness = false
+name = "fibonacci_e2e_proof"
