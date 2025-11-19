@@ -15,6 +15,9 @@ use metal::{
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::core::poly::circle::CircleDomain;
+use crate::core::utils::bit_reverse_index;
+
 use super::shaders;
 use super::twiddle_manager::FlatTwiddleManager;
 use super::buffer_pool::GlobalPools;
@@ -85,6 +88,10 @@ pub struct MetalContext {
 
     /// Global buffer pools for reusable buffers.
     buffer_pools: GlobalPools,
+
+    /// Cache for domain evaluation points (x, y) in bit-reversed order.
+    /// Key is log_size, value is (x_buffer, y_buffer) with M31 values.
+    domain_xy_cache: Mutex<HashMap<u32, (Buffer, Buffer)>>,
 }
 
 impl MetalContext {
@@ -155,6 +162,7 @@ impl MetalContext {
             twiddle_cache: Mutex::new(HashMap::new()),
             flat_twiddle_manager: FlatTwiddleManager::new(),
             buffer_pools,
+            domain_xy_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -323,6 +331,57 @@ impl MetalContext {
         }
 
         buffer
+    }
+
+    /// Get or create cached domain evaluation point buffers (x, y) in bit-reversed order.
+    ///
+    /// This caches the expensive domain point computation for reuse across multiple
+    /// quotient accumulation calls with the same domain size.
+    ///
+    /// Returns (x_buffer, y_buffer) where each contains M31 values (u32).
+    pub fn get_or_create_domain_xy_buffers(&self, domain: CircleDomain) -> (Buffer, Buffer) {
+        let log_size = domain.log_size();
+        let cache_key = log_size;
+
+        // Check cache first
+        {
+            let cache = self.domain_xy_cache.lock().unwrap();
+            if let Some((x_buf, y_buf)) = cache.get(&cache_key) {
+                return (x_buf.clone(), y_buf.clone());
+            }
+        }
+
+        // Compute domain points in bit-reversed order
+        let domain_size = domain.size();
+        let mut domain_points_x = Vec::with_capacity(domain_size);
+        let mut domain_points_y = Vec::with_capacity(domain_size);
+
+        for i in 0..domain_size {
+            let point = domain.at(bit_reverse_index(i, log_size));
+            domain_points_x.push(point.x.0);
+            domain_points_y.push(point.y.0);
+        }
+
+        // Create Metal buffers
+        let x_buffer = self.device.new_buffer_with_data(
+            domain_points_x.as_ptr() as *const _,
+            (domain_size * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let y_buffer = self.device.new_buffer_with_data(
+            domain_points_y.as_ptr() as *const _,
+            (domain_size * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Store in cache
+        {
+            let mut cache = self.domain_xy_cache.lock().unwrap();
+            cache.insert(cache_key, (x_buffer.clone(), y_buffer.clone()));
+        }
+
+        (x_buffer, y_buffer)
     }
 
     /// Get MTLResourceOptions for shared memory (unified memory on Apple Silicon).

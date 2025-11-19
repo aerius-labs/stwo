@@ -43,7 +43,7 @@ pub use context::{MetalContext, MetalContextHandle};
 
 // Export Metal column types (now actively used)
 #[cfg(target_os = "macos")]
-pub use column::{MetalBaseColumn, MetalSecureColumn};
+pub use column::{GpuSlice, MetalBaseColumn, MetalSecureColumn};
 
 #[cfg(target_os = "macos")]
 use serde::{Deserialize, Serialize};

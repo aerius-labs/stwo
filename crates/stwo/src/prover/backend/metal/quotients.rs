@@ -7,7 +7,6 @@ use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::pcs::quotients::{column_line_coeffs, ColumnSampleBatch};
 use crate::core::poly::circle::CircleDomain;
-use crate::core::utils::bit_reverse_index;
 use crate::prover::backend::simd::SimdBackend;
 use crate::prover::backend::Column;
 use crate::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
@@ -62,14 +61,9 @@ impl QuotientOps for MetalBackend {
         // Precompute line coefficients (a, b, c) for each sample
         let line_coeffs = column_line_coeffs(sample_batches, random_coeff);
 
-        // Extract domain points (x, y) in bit-reversed order
-        let mut domain_points_x = Vec::with_capacity(domain_size);
-        let mut domain_points_y = Vec::with_capacity(domain_size);
-        for i in 0..domain_size {
-            let point = domain.at(bit_reverse_index(i, domain.log_size()));
-            domain_points_x.push(point.x.0);
-            domain_points_y.push(point.y.0);
-        }
+        // Get cached domain points (x, y) in bit-reversed order
+        let ctx = MetalContext::global();
+        let (domain_x_buffer, domain_y_buffer) = ctx.get_or_create_domain_xy_buffers(domain);
 
         // Flatten column data (each column has domain_size M31 values)
         // Zero-copy access to GPU buffer via as_slice()
@@ -135,22 +129,10 @@ impl QuotientOps for MetalBackend {
         }
 
         // Dispatch to Metal GPU
-        let ctx = MetalContext::global();
         let device = ctx.device();
         let command_queue = ctx.command_queue();
 
-        // Create buffers
-        let domain_x_buffer = device.new_buffer_with_data(
-            domain_points_x.as_ptr() as *const _,
-            (domain_size * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        let domain_y_buffer = device.new_buffer_with_data(
-            domain_points_y.as_ptr() as *const _,
-            (domain_size * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // Create buffers (domain x/y already cached)
 
         let columns_buffer = device.new_buffer_with_data(
             columns_data.as_ptr() as *const _,
@@ -230,21 +212,10 @@ impl QuotientOps for MetalBackend {
         command_buffer.commit();
         command_buffer.wait_until_completed();
 
-        // Read output and convert to SecureColumnByCoords
-        let output_ptr = output_buffer.contents() as *const u32;
-        let output_slice = unsafe { std::slice::from_raw_parts(output_ptr, domain_size * 4) };
-
-        let mut values = unsafe { SecureColumnByCoords::<Self>::uninitialized(domain_size) };
-        for i in 0..domain_size {
-            let qm31_data = &output_slice[i * 4..(i + 1) * 4];
-            let value = SecureField::from_u32_unchecked(
-                qm31_data[0], // c0.a
-                qm31_data[1], // c0.b
-                qm31_data[2], // c1.a
-                qm31_data[3], // c1.b
-            );
-            values.set(i, value);
-        }
+        // Convert output buffer directly to SecureColumnByCoords - zero-copy
+        let values = unsafe {
+            SecureColumnByCoords::from_qm31_interleaved_buffer(&output_buffer, domain_size)
+        };
 
         SecureEvaluation::new(domain, values)
     }
