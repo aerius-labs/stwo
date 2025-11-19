@@ -155,6 +155,8 @@ impl MerkleOps<Blake2sMerkleHasher> for MetalBackend {
         prev_layer: Option<&Vec<Blake2sHash>>,
         columns: &[&Col<Self, BaseField>],
     ) -> Vec<Blake2sHash> {
+        let _timer = crate::metal_profile_fn!("merkle_blake2s", "CPU/GPU", log_size = log_size, num_columns = columns.len());
+
         // Fall back to SIMD for small sizes or when columns are present
         // (column hashing not yet implemented in Metal)
         if log_size < MIN_MERKLE_LOG_SIZE || !columns.is_empty() || prev_layer.is_none() {
@@ -283,6 +285,8 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
         prev_layer: Option<&Vec<Blake2sHash>>,
         columns: &[&Col<Self, BaseField>],
     ) -> Vec<Blake2sHash> {
+        let _timer = crate::metal_profile_fn!("merkle_m31", "CPU/GPU", log_size = log_size, num_columns = columns.len());
+
         // Fall back to SIMD for small sizes or when columns are present
         if log_size < MIN_MERKLE_LOG_SIZE || !columns.is_empty() || prev_layer.is_none() {
             use crate::prover::backend::Column;

@@ -25,6 +25,15 @@ use super::buffer_pool::GlobalPools;
 /// Global Metal context singleton.
 static METAL_CONTEXT: OnceLock<Arc<MetalContext>> = OnceLock::new();
 
+/// Initialize profiling on first context access.
+fn init_profiling_once() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        super::profiling::init_profiling();
+    });
+}
+
 /// Metal context managing device, queue, and pipeline states.
 ///
 /// This is the central coordination point for all Metal GPU operations.
@@ -78,6 +87,12 @@ pub struct MetalContext {
 
     /// Proof-of-work grinding kernel pipeline.
     grind_pipeline: ComputePipelineState,
+
+    /// Pack coordinates to QM31 interleaved format kernel pipeline.
+    pack_coords_to_qm31_pipeline: ComputePipelineState,
+
+    /// Unpack QM31 interleaved format to coordinates kernel pipeline.
+    unpack_qm31_to_coords_pipeline: ComputePipelineState,
 
     /// Cache for twiddle factor buffers.
     /// Key is a hash of the twiddle data, value is the Metal buffer.
@@ -139,6 +154,8 @@ impl MetalContext {
         let mle_fold_m31_pipeline = Self::create_pipeline(&device, &library, "mle_fold_m31_to_qm31")?;
         let mle_fold_qm31_pipeline = Self::create_pipeline(&device, &library, "mle_fold_qm31_to_qm31")?;
         let grind_pipeline = Self::create_pipeline(&device, &library, "grind_pow")?;
+        let pack_coords_to_qm31_pipeline = Self::create_pipeline(&device, &library, "pack_coords_to_qm31")?;
+        let unpack_qm31_to_coords_pipeline = Self::create_pipeline(&device, &library, "unpack_qm31_to_coords")?;
 
         let buffer_pools = GlobalPools::new(device.clone());
 
@@ -159,6 +176,8 @@ impl MetalContext {
             mle_fold_m31_pipeline,
             mle_fold_qm31_pipeline,
             grind_pipeline,
+            pack_coords_to_qm31_pipeline,
+            unpack_qm31_to_coords_pipeline,
             twiddle_cache: Mutex::new(HashMap::new()),
             flat_twiddle_manager: FlatTwiddleManager::new(),
             buffer_pools,
@@ -183,6 +202,7 @@ impl MetalContext {
 
     /// Get the global Metal context, initializing it if needed.
     pub fn global() -> Arc<Self> {
+        init_profiling_once();
         METAL_CONTEXT
             .get_or_init(|| {
                 Arc::new(Self::new().expect("Failed to initialize Metal context"))
@@ -268,6 +288,16 @@ impl MetalContext {
     /// Get proof-of-work grinding pipeline.
     pub fn grind_pipeline(&self) -> &ComputePipelineState {
         &self.grind_pipeline
+    }
+
+    /// Get pack coordinates to QM31 pipeline.
+    pub fn pack_coords_to_qm31_pipeline(&self) -> &ComputePipelineState {
+        &self.pack_coords_to_qm31_pipeline
+    }
+
+    /// Get unpack QM31 to coordinates pipeline.
+    pub fn unpack_qm31_to_coords_pipeline(&self) -> &ComputePipelineState {
+        &self.unpack_qm31_to_coords_pipeline
     }
 
     /// Get or create a flattened twiddle buffer from multiple layers.

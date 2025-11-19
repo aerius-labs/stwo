@@ -1178,3 +1178,48 @@ kernel void mle_fold_qm31_to_qm31(
 
     output[tid] = result;
 }
+
+/// Pack 4 coordinate columns into interleaved QM31 layout.
+/// Input: 4 separate M31 coordinate buffers (col0, col1, col2, col3)
+/// Output: Interleaved u32 buffer [a0,b0,c0,d0, a1,b1,c1,d1, ...]
+/// where QM31 = (CM31(a, b), CM31(c, d))
+kernel void pack_coords_to_qm31(
+    device const uint32_t* col0 [[buffer(0)]],  // First coordinate (a)
+    device const uint32_t* col1 [[buffer(1)]],  // Second coordinate (b)
+    device const uint32_t* col2 [[buffer(2)]],  // Third coordinate (c)
+    device const uint32_t* col3 [[buffer(3)]],  // Fourth coordinate (d)
+    device uint32_t* out_qm31 [[buffer(4)]],    // Interleaved output
+    constant uint32_t& len [[buffer(5)]],       // Number of QM31 elements
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+
+    // Write interleaved: [a, b, c, d] for this element
+    uint32_t out_idx = gid * 4;
+    out_qm31[out_idx + 0] = col0[gid];
+    out_qm31[out_idx + 1] = col1[gid];
+    out_qm31[out_idx + 2] = col2[gid];
+    out_qm31[out_idx + 3] = col3[gid];
+}
+
+/// Unpack interleaved QM31 layout into 4 coordinate columns.
+/// Input: Interleaved u32 buffer [a0,b0,c0,d0, a1,b1,c1,d1, ...]
+/// Output: 4 separate M31 coordinate buffers (col0, col1, col2, col3)
+kernel void unpack_qm31_to_coords(
+    device const uint32_t* in_qm31 [[buffer(0)]],  // Interleaved input
+    device uint32_t* col0 [[buffer(1)]],           // First coordinate (a)
+    device uint32_t* col1 [[buffer(2)]],           // Second coordinate (b)
+    device uint32_t* col2 [[buffer(3)]],           // Third coordinate (c)
+    device uint32_t* col3 [[buffer(4)]],           // Fourth coordinate (d)
+    constant uint32_t& len [[buffer(5)]],          // Number of QM31 elements
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= len) return;
+
+    // Read interleaved: [a, b, c, d] for this element
+    uint32_t in_idx = gid * 4;
+    col0[gid] = in_qm31[in_idx + 0];
+    col1[gid] = in_qm31[in_idx + 1];
+    col2[gid] = in_qm31[in_idx + 2];
+    col3[gid] = in_qm31[in_idx + 3];
+}

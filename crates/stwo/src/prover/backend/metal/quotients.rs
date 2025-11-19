@@ -27,6 +27,8 @@ impl QuotientOps for MetalBackend {
         sample_batches: &[ColumnSampleBatch],
         _log_blowup_factor: u32,
     ) -> SecureEvaluation<Self, BitReversedOrder> {
+        let _timer = crate::metal_profile_fn!("quotient", "GPU", log_size = domain.log_size(), num_columns = columns.len());
+
         // Fall back to SIMD for small domains
         if domain.log_size() < MIN_QUOTIENT_LOG_SIZE || !MetalContext::is_available() {
             use crate::prover::backend::simd::column::BaseColumn;

@@ -26,6 +26,7 @@ impl FriOps for MetalBackend {
         twiddles: &TwiddleTree<Self>,
     ) -> LineEvaluation<Self> {
         let log_size = eval.len().ilog2();
+        let _timer = crate::metal_profile_fn!("fri_fold_line", "GPU", log_size = log_size);
 
         // Fall back to SIMD for small sizes
         if log_size < MIN_FRI_LOG_SIZE {
@@ -117,6 +118,7 @@ impl FriOps for MetalBackend {
         twiddles: &TwiddleTree<Self>,
     ) {
         let log_size = src.len().ilog2();
+        let _timer = crate::metal_profile_fn!("fri_fold_circle", "GPU", log_size = log_size);
 
         // Fall back to SIMD for small sizes
         if log_size < MIN_FRI_LOG_SIZE {

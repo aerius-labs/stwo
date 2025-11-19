@@ -125,6 +125,9 @@ impl PolyOps for MetalBackend {
     where
         Self: crate::prover::backend::Backend,
     {
+        let num_polys = polynomials.len();
+        let _timer = crate::metal_profile_fn!("fft_batch", "GPU", num_polys = num_polys);
+
         use crate::core::poly::circle::CanonicCoset;
 
         // If no polynomials or all are small, use default implementation
@@ -244,6 +247,81 @@ impl PolyOps for MetalBackend {
             CircleCoefficients::new(right),
         )
     }
+
+    /// Batched IFFT for multiple columns to reduce GPU dispatch overhead.
+    /// This is critical for performance - interpolating 208 columns individually
+    /// wastes ~76ms on synchronous GPU dispatches (76% of proof time at log_n=14).
+    fn interpolate_columns(
+        columns: impl IntoIterator<Item = CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        twiddles: &TwiddleTree<Self>,
+    ) -> Vec<CircleCoefficients<Self>> {
+        let columns: Vec<_> = columns.into_iter().collect();
+
+        // Fall back to serial for small batches
+        if columns.is_empty() || columns.iter().all(|eval| eval.domain.log_size() < MIN_FFT_LOG_SIZE) {
+            return columns
+                .into_iter()
+                .map(|eval| eval.interpolate_with_twiddles(twiddles))
+                .collect();
+        }
+
+        let ctx = MetalContext::global();
+        let mut results = Vec::with_capacity(columns.len());
+
+        // Create single command buffer for ALL IFFTs
+        let command_buffer = ctx.command_queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        // Dispatch all IFFT operations to GPU (without waiting)
+        for eval in &columns {
+            let log_size = eval.domain.log_size();
+
+            // Skip tiny sizes
+            if log_size < MIN_FFT_LOG_SIZE {
+                continue;
+            }
+
+            // Dispatch IFFT to the shared encoder (no commit/wait)
+            metal_ifft_batched_dispatch(&ctx, &encoder, eval, twiddles);
+        }
+
+        // Submit all IFFTs at once
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Now read results
+        for eval in columns {
+            if eval.domain.log_size() < MIN_FFT_LOG_SIZE {
+                // Use SIMD fallback for small sizes
+                use crate::prover::backend::Column;
+                use crate::prover::backend::simd::column::BaseColumn;
+
+                let cpu_vals = eval.values.to_cpu();
+                let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+                let simd_eval = CircleEvaluation::new(eval.domain, simd_col);
+
+                let simd_twiddles = TwiddleTree {
+                    root_coset: twiddles.root_coset,
+                    twiddles: twiddles.twiddles.clone(),
+                    itwiddles: twiddles.itwiddles.clone(),
+                };
+                let simd_result = SimdBackend::interpolate(simd_eval, &simd_twiddles);
+
+                let cpu_coeffs = simd_result.coeffs.to_cpu();
+                let metal_coeffs: MetalBaseColumn = cpu_coeffs.into_iter().collect();
+                results.push(CircleCoefficients::new(metal_coeffs));
+            } else {
+                // Results are already in GPU buffers from batched dispatch
+                let data_len = eval.values.len();
+                let data_buffer = eval.values.buffer().clone();
+                let result_col = MetalBaseColumn::from_buffer(data_buffer, data_len);
+                results.push(CircleCoefficients::new(result_col));
+            }
+        }
+
+        results
+    }
 }
 
 // ============================================================================
@@ -263,6 +341,8 @@ fn metal_fft_dispatch(
     twiddles: &TwiddleTree<MetalBackend>,
 ) -> CircleEvaluation<MetalBackend, BaseField, BitReversedOrder> {
     let log_size = poly.log_size();
+    let _timer = crate::metal_profile_fn!("fft", "GPU", log_size = log_size);
+
     let domain_log_size = domain.log_size();
 
     // Fall back to SIMD if size is too small
@@ -719,6 +799,7 @@ fn metal_ifft_dispatch(
     twiddles: &TwiddleTree<MetalBackend>,
 ) -> CircleCoefficients<MetalBackend> {
     let log_size = eval.domain.log_size();
+    let _timer = crate::metal_profile_fn!("ifft", "GPU", log_size = log_size);
 
     // Number of IFFT layers is log_size - 1 (based on coset size)
     let num_ifft_layers = log_size - 1;
@@ -958,6 +1039,146 @@ fn metal_ifft_dispatch(
     // Wrap GPU buffer directly - zero copy with MTLStorageModeShared
     let result_col = MetalBaseColumn::from_buffer(data_buffer.clone(), data_len);
     CircleCoefficients::new(result_col)
+}
+
+/// Batched IFFT dispatch - adds IFFT operations to an existing encoder without committing.
+/// This allows multiple IFFTs to be batched into a single command buffer submission.
+fn metal_ifft_batched_dispatch(
+    ctx: &MetalContext,
+    encoder: &metal::ComputeCommandEncoderRef,
+    eval: &CircleEvaluation<MetalBackend, BaseField, BitReversedOrder>,
+    twiddles: &TwiddleTree<MetalBackend>,
+) {
+    let log_size = eval.domain.log_size();
+    let device = ctx.device();
+    let data_buffer = eval.values.buffer();
+
+    // Convert flat inverse twiddles to per-layer slices
+    let itwiddle_slices = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
+    let num_ifft_layers = log_size - 1;
+
+    const VECWISE_FFT_BITS: u32 = 5;
+    let _non_vecwise_layers = if num_ifft_layers > VECWISE_FFT_BITS {
+        num_ifft_layers - VECWISE_FFT_BITS
+    } else {
+        0
+    };
+
+    // Phase 1: Process circle layer (layer 0) FIRST with special circle twiddles (DIT IFFT)
+    if num_ifft_layers > 0 {
+        let first_line_itw_idx = 0usize;
+        let first_line_itwiddles = itwiddle_slices[first_line_itw_idx];
+        let circle_itwiddles = circle_twiddles_from_line_twiddles(first_line_itwiddles);
+
+        let itw_buffer = device.new_buffer_with_data(
+            circle_itwiddles.as_ptr() as *const _,
+            (circle_itwiddles.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        encoder.set_compute_pipeline_state(ctx.ifft_radix2_pipeline());
+        encoder.set_buffer(0, Some(&data_buffer), 0);
+        encoder.set_buffer(1, Some(&itw_buffer), 0);
+        encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
+        let layer = 0u32;
+        encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &layer as *const u32 as *const _);
+
+        let num_threads = 1u64 << (log_size - 1);
+        let threadgroup_size = 256.min(num_threads.max(1));
+        let threadgroups = if num_threads == 0 { 1 } else { (num_threads + threadgroup_size - 1) / threadgroup_size };
+
+        encoder.dispatch_thread_groups(
+            metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+            metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+        );
+    }
+
+    // Phase 2: Process vecwise line layers using radix-2, in FORWARD order (DIT IFFT)
+    let line_layers_start = 1u32;
+    let line_layers_end = if _non_vecwise_layers == 0 {
+        num_ifft_layers
+    } else {
+        VECWISE_FFT_BITS - 1
+    };
+
+    for layer in line_layers_start..=line_layers_end {
+        let itw_idx = (layer - 1) as usize;
+        let itw_layer = itwiddle_slices[itw_idx];
+
+        let itw_buffer = device.new_buffer_with_data(
+            itw_layer.as_ptr() as *const _,
+            (itw_layer.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        encoder.set_compute_pipeline_state(ctx.ifft_radix2_pipeline());
+        encoder.set_buffer(0, Some(&data_buffer), 0);
+        encoder.set_buffer(1, Some(&itw_buffer), 0);
+        encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
+        encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &layer as *const u32 as *const _);
+
+        let num_threads = 1u64 << (log_size - 1);
+        let threadgroup_size = 256.min(num_threads.max(1));
+        let threadgroups = if num_threads == 0 { 1 } else { (num_threads + threadgroup_size - 1) / threadgroup_size };
+
+        encoder.dispatch_thread_groups(
+            metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+            metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+        );
+    }
+
+    // Phase 3: Process non-vecwise layers (5+) using radix-2
+    if _non_vecwise_layers > 0 {
+        let non_vecwise_start = VECWISE_FFT_BITS;
+        let non_vecwise_end = num_ifft_layers;
+
+        for layer in non_vecwise_start..=non_vecwise_end {
+            let itw_idx = (layer - 1) as usize;
+            let itw_layer = itwiddle_slices[itw_idx];
+
+            let itw_buffer = device.new_buffer_with_data(
+                itw_layer.as_ptr() as *const _,
+                (itw_layer.len() * std::mem::size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            encoder.set_compute_pipeline_state(ctx.ifft_radix2_pipeline());
+            encoder.set_buffer(0, Some(&data_buffer), 0);
+            encoder.set_buffer(1, Some(&itw_buffer), 0);
+            encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
+            encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &layer as *const u32 as *const _);
+
+            let num_threads = 1u64 << (log_size - 1);
+            let threadgroup_size = 256.min(num_threads.max(1));
+            let threadgroups = if num_threads == 0 { 1 } else { (num_threads + threadgroup_size - 1) / threadgroup_size };
+
+            encoder.dispatch_thread_groups(
+                metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+                metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+            );
+        }
+    }
+
+    // Phase 4: Normalization
+    let domain_size = eval.domain.size();
+    let n_inv = BaseField::from(domain_size).inverse();
+    let data_len = eval.values.len();
+    let normalize_count = domain_size.min(data_len) as u32;
+    let n_inv_raw = n_inv.0;
+
+    encoder.set_compute_pipeline_state(ctx.ifft_normalize_pipeline());
+    encoder.set_buffer(0, Some(&data_buffer), 0);
+    encoder.set_bytes(1, std::mem::size_of::<u32>() as u64, &n_inv_raw as *const u32 as *const _);
+    encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &normalize_count as *const u32 as *const _);
+
+    let num_threads = normalize_count as u64;
+    let threadgroup_size = 256.min(num_threads.max(1));
+    let threadgroups = if num_threads == 0 { 1 } else { (num_threads + threadgroup_size - 1) / threadgroup_size };
+
+    encoder.dispatch_thread_groups(
+        metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+        metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+    );
 }
 
 #[cfg(test)]

@@ -36,6 +36,8 @@ mod shaders;
 mod twiddle_manager;
 #[cfg(target_os = "macos")]
 mod buffer_pool;
+#[cfg(target_os = "macos")]
+pub mod profiling;
 
 // Export Metal context (actively used)
 #[cfg(target_os = "macos")]
