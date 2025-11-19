@@ -180,16 +180,12 @@ impl PolyOps for MetalBackend {
             command_buffer.commit();
             command_buffer.wait_until_completed();
 
-            // Second pass: read results from GPU buffers after completion
+            // Second pass: wrap results from GPU buffers (zero-copy)
             for (poly_coeffs, (domain, output_buffer)) in metal_batch.into_iter().zip(metal_buffers.iter()) {
                 let eval_size = domain.size();
-                let result_vec: Vec<BaseField> = unsafe {
-                    std::slice::from_raw_parts(
-                        output_buffer.contents() as *const BaseField,
-                        eval_size,
-                    ).to_vec()
-                };
-                let evals = CircleEvaluation::new(*domain, result_vec.into_iter().collect());
+                // Zero-copy: wrap GPU buffer directly instead of copying to Vec
+                let result_col = MetalBaseColumn::from_buffer(output_buffer.clone(), eval_size);
+                let evals = CircleEvaluation::new(*domain, result_col);
                 metal_results.push(Poly::new(
                     store_polynomials_coefficients.then_some(poly_coeffs),
                     evals,

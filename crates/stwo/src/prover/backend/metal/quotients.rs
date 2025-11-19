@@ -68,13 +68,24 @@ impl QuotientOps for MetalBackend {
         let (domain_x_buffer, domain_y_buffer) = ctx.get_or_create_domain_xy_buffers(domain);
 
         // Flatten column data (each column has domain_size M31 values)
-        // Zero-copy access to GPU buffer via as_slice()
-        let mut columns_data = Vec::with_capacity(num_columns * domain_size);
-        for col in columns {
-            let col_values = col.values.as_slice();
-            for val in col_values {
-                columns_data.push(val.0);
+        // Optimized: direct buffer copy instead of nested loops
+        let _flatten_timer = std::time::Instant::now();
+        let mut columns_data: Vec<u32> = Vec::with_capacity(num_columns * domain_size);
+        unsafe {
+            columns_data.set_len(num_columns * domain_size);
+            let mut offset = 0;
+            for col in columns {
+                let col_slice = col.values.as_slice();
+                std::ptr::copy_nonoverlapping(
+                    col_slice.as_ptr() as *const u32,
+                    columns_data.as_mut_ptr().add(offset),
+                    domain_size,
+                );
+                offset += domain_size;
             }
+        }
+        if std::env::var("METAL_PROFILE").is_ok() {
+            eprintln!("[CPU_PROFILE] quotient_flatten | num_columns={}, domain_size={} | time={:.3}ms", num_columns, domain_size, _flatten_timer.elapsed().as_secs_f64() * 1000.0);
         }
 
         // Flatten line coefficients and build metadata
@@ -212,7 +223,12 @@ impl QuotientOps for MetalBackend {
 
         encoder.end_encoding();
         command_buffer.commit();
+
+        let _gpu_timer = std::time::Instant::now();
         command_buffer.wait_until_completed();
+        if std::env::var("METAL_PROFILE").is_ok() {
+            eprintln!("[CPU_PROFILE] quotient_gpu_wait | time={:.3}ms", _gpu_timer.elapsed().as_secs_f64() * 1000.0);
+        }
 
         // Convert output buffer directly to SecureColumnByCoords - zero-copy
         let values = unsafe {
