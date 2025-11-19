@@ -23,17 +23,27 @@ impl MleOps<BaseField> for MetalBackend {
 
         // Fall back to SIMD for small sizes
         if log_size < MIN_MLE_LOG_SIZE {
-            let simd_mle: Mle<SimdBackend, BaseField> = unsafe { std::mem::transmute(mle) };
+            use crate::prover::backend::simd::column::BaseColumn;
+
+            // Convert Metal MLE to SIMD
+            let cpu_vals = mle.into_evals().to_cpu();
+            let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+            let simd_mle: Mle<SimdBackend, BaseField> = Mle::new(simd_col);
+
             let simd_result = SimdBackend::fix_first_variable(simd_mle, assignment);
-            return unsafe { std::mem::transmute(simd_result) };
+
+            // Convert result back to Metal
+            let result_cpu = simd_result.into_evals().to_cpu();
+            let metal_col = result_cpu.into_iter().collect();
+            return Mle::new(metal_col);
         }
 
         // Metal GPU path
         let ctx = MetalContext::global();
         let device = ctx.device();
 
-        // Extract input data (M31 values)
-        let input_data: Vec<u32> = mle.into_evals().to_cpu().iter().map(|f| f.0).collect();
+        // Zero-copy access to input data (M31 values) via Deref
+        let input_data: Vec<u32> = mle.as_slice().iter().map(|f| f.0).collect();
         let output_len = input_data.len() / 2;
 
         // Create Metal buffers
@@ -109,19 +119,29 @@ impl MleOps<SecureField> for MetalBackend {
 
         // Fall back to SIMD for small sizes
         if log_size < MIN_MLE_LOG_SIZE {
-            let simd_mle: Mle<SimdBackend, SecureField> = unsafe { std::mem::transmute(mle) };
+            use crate::prover::backend::simd::column::SecureColumn;
+
+            // Convert Metal MLE to SIMD
+            let cpu_vals = mle.into_evals().to_cpu();
+            let simd_col: SecureColumn = cpu_vals.into_iter().collect();
+            let simd_mle: Mle<SimdBackend, SecureField> = Mle::new(simd_col);
+
             let simd_result = SimdBackend::fix_first_variable(simd_mle, assignment);
-            return unsafe { std::mem::transmute(simd_result) };
+
+            // Convert result back to Metal
+            let result_cpu = simd_result.into_evals().to_cpu();
+            let metal_col = result_cpu.into_iter().collect();
+            return Mle::new(metal_col);
         }
 
         // Metal GPU path
         let ctx = MetalContext::global();
         let device = ctx.device();
 
-        // Extract input data and convert to interleaved QM31 layout
-        let input_values: Vec<SecureField> = mle.into_evals().to_cpu();
+        // Zero-copy access to input data and convert to interleaved QM31 layout via Deref
+        let input_values = mle.as_slice();
         let mut input_data = Vec::with_capacity(input_values.len() * 4);
-        for val in &input_values {
+        for val in input_values {
             let [a, b, c, d] = val.to_m31_array();
             input_data.push(a.0);
             input_data.push(b.0);
@@ -202,15 +222,51 @@ impl GkrOps for MetalBackend {
     fn gen_eq_evals(y: &[SecureField], v: SecureField) -> Mle<Self, SecureField> {
         // TODO(Phase 4): Dispatch to Metal GPU for large MLE operations
         let simd_result = SimdBackend::gen_eq_evals(y, v);
-        // Transmute result from SIMD to Metal backend
-        unsafe { std::mem::transmute(simd_result) }
+
+        // Convert result from SIMD to Metal
+        let result_cpu = simd_result.into_evals().to_cpu();
+        let metal_col = result_cpu.into_iter().collect();
+        Mle::new(metal_col)
     }
 
     fn next_layer(layer: &Layer<Self>) -> Layer<Self> {
-        // Layer transitions use SIMD, transmute types
-        let simd_layer: &Layer<SimdBackend> = unsafe { &*(layer as *const _ as *const _) };
-        let simd_result = SimdBackend::next_layer(simd_layer);
-        unsafe { std::mem::transmute(simd_result) }
+        // TODO(Phase 4): Layer transitions could use Metal GPU
+        // For now, delegate to CPU backend like SIMD does
+        use crate::prover::backend::cpu::CpuBackend;
+
+        // Convert Metal layer to CPU, process, convert back
+        let cpu_layer = layer.to_cpu();
+        let cpu_result = CpuBackend::next_layer(&cpu_layer);
+
+        // Convert result back to Metal using from_cpu pattern
+        match cpu_result {
+            Layer::GrandProduct(mle) => {
+                let metal_col = mle.into_evals().into_iter().collect();
+                Layer::GrandProduct(Mle::new(metal_col))
+            }
+            Layer::LogUpGeneric { numerators, denominators } => {
+                let metal_num = numerators.into_evals().into_iter().collect();
+                let metal_den = denominators.into_evals().into_iter().collect();
+                Layer::LogUpGeneric {
+                    numerators: Mle::new(metal_num),
+                    denominators: Mle::new(metal_den),
+                }
+            }
+            Layer::LogUpMultiplicities { numerators, denominators } => {
+                let metal_num = numerators.into_evals().into_iter().collect();
+                let metal_den = denominators.into_evals().into_iter().collect();
+                Layer::LogUpMultiplicities {
+                    numerators: Mle::new(metal_num),
+                    denominators: Mle::new(metal_den),
+                }
+            }
+            Layer::LogUpSingles { denominators } => {
+                let metal_den = denominators.into_evals().into_iter().collect();
+                Layer::LogUpSingles {
+                    denominators: Mle::new(metal_den),
+                }
+            }
+        }
     }
 
     fn sum_as_poly_in_first_variable(

@@ -30,16 +30,31 @@ impl QuotientOps for MetalBackend {
     ) -> SecureEvaluation<Self, BitReversedOrder> {
         // Fall back to SIMD for small domains
         if domain.log_size() < MIN_QUOTIENT_LOG_SIZE || !MetalContext::is_available() {
-            let simd_columns: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>] =
-                unsafe { &*(columns as *const _ as *const _) };
+            use crate::prover::backend::simd::column::BaseColumn;
+
+            // Convert Metal columns to SIMD
+            let simd_columns_owned: Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> = columns
+                .iter()
+                .map(|col| {
+                    let cpu_vals = col.values.to_cpu();
+                    let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+                    CircleEvaluation::new(col.domain, simd_col)
+                })
+                .collect();
+            let simd_columns_refs: Vec<&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> =
+                simd_columns_owned.iter().collect();
+
             let simd_result = SimdBackend::accumulate_quotients(
                 domain,
-                simd_columns,
+                &simd_columns_refs,
                 random_coeff,
                 sample_batches,
                 _log_blowup_factor,
             );
-            return unsafe { std::mem::transmute(simd_result) };
+
+            // Convert result back to Metal
+            let metal_values = SecureColumnByCoords::from_simd(simd_result.values);
+            return SecureEvaluation::new(simd_result.domain, metal_values);
         }
         let domain_size = domain.size();
         let num_columns = columns.len();
@@ -57,9 +72,10 @@ impl QuotientOps for MetalBackend {
         }
 
         // Flatten column data (each column has domain_size M31 values)
+        // Zero-copy access to GPU buffer via as_slice()
         let mut columns_data = Vec::with_capacity(num_columns * domain_size);
         for col in columns {
-            let col_values: Vec<BaseField> = col.values.to_cpu().to_vec();
+            let col_values = col.values.as_slice();
             for val in col_values {
                 columns_data.push(val.0);
             }

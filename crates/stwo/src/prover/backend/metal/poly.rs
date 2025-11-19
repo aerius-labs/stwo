@@ -20,7 +20,7 @@ use crate::core::ColumnVec;
 
 use super::context::MetalContext;
 use super::thresholds::MIN_FFT_LOG_SIZE;
-use super::MetalBackend;
+use super::{MetalBackend, MetalBaseColumn};
 
 /// Generates circle twiddles (layer 0) from first line twiddles (layer 1).
 /// For each pair [x, y] in first_line_twiddles, generates [y, -y, -x, x].
@@ -57,10 +57,14 @@ impl PolyOps for MetalBackend {
         poly: &CircleCoefficients<Self>,
         point: CirclePoint<SecureField>,
     ) -> SecureField {
-        // Point evaluation: convert Metal->SIMD (same columns, different Backend param)
-        let simd_poly: &CircleCoefficients<SimdBackend> =
-            unsafe { &*(poly as *const _ as *const CircleCoefficients<SimdBackend>) };
-        SimdBackend::eval_at_point(simd_poly, point)
+        use crate::prover::backend::Column;
+        use crate::prover::backend::simd::column::BaseColumn;
+
+        // Convert Metal poly to SIMD
+        let cpu_coeffs = poly.coeffs.to_cpu();
+        let simd_coeffs: BaseColumn = cpu_coeffs.into_iter().collect();
+        let simd_poly = CircleCoefficients::new(simd_coeffs);
+        SimdBackend::eval_at_point(&simd_poly, point)
     }
 
     fn eval_at_point_by_folding(
@@ -68,24 +72,39 @@ impl PolyOps for MetalBackend {
         point: CirclePoint<SecureField>,
         twiddles: &TwiddleTree<Self>,
     ) -> SecureField {
-        // Folding evaluation: use unsafe transmute since types are layout-compatible
-        let simd_evals: &CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> =
-            unsafe { &*(evals as *const _ as *const _) };
+        use crate::prover::backend::Column;
+        use crate::prover::backend::simd::column::BaseColumn;
+
+        // Convert Metal eval to SIMD
+        let cpu_vals = evals.values.to_cpu();
+        let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+        let simd_evals = CircleEvaluation::new(evals.domain, simd_col);
+
+        // Twiddles can be transmuted (they're just metadata)
         let simd_twiddles: &TwiddleTree<SimdBackend> =
             unsafe { &*(twiddles as *const _ as *const _) };
-        SimdBackend::eval_at_point_by_folding(simd_evals, point, simd_twiddles)
+
+        SimdBackend::eval_at_point_by_folding(&simd_evals, point, simd_twiddles)
     }
 
     fn extend(
         poly: &CircleCoefficients<Self>,
         log_size: u32,
     ) -> CircleCoefficients<Self> {
-        // Extension: transmute to SIMD, extend, transmute back
-        let simd_poly: &CircleCoefficients<SimdBackend> =
-            unsafe { &*(poly as *const _ as *const _) };
-        let simd_result = SimdBackend::extend(simd_poly, log_size);
-        // Convert back by reconstructing with the same column
-        CircleCoefficients::new(simd_result.coeffs)
+        use crate::prover::backend::Column;
+        use crate::prover::backend::simd::column::BaseColumn;
+
+        // Convert Metal poly to SIMD
+        let cpu_coeffs = poly.coeffs.to_cpu();
+        let simd_coeffs: BaseColumn = cpu_coeffs.into_iter().collect();
+        let simd_poly = CircleCoefficients::new(simd_coeffs);
+
+        let simd_result = SimdBackend::extend(&simd_poly, log_size);
+
+        // Convert result back to Metal
+        let cpu_result = simd_result.coeffs.to_cpu();
+        let metal_coeffs: MetalBaseColumn = cpu_result.into_iter().collect();
+        CircleCoefficients::new(metal_coeffs)
     }
 
     fn evaluate(
@@ -248,12 +267,23 @@ fn metal_fft_dispatch(
 
     // Fall back to SIMD if size is too small
     if log_size < MIN_FFT_LOG_SIZE {
-        let simd_poly: &CircleCoefficients<SimdBackend> =
-            unsafe { &*(poly as *const _ as *const _) };
+        use crate::prover::backend::Column;
+        use crate::prover::backend::simd::column::BaseColumn;
+
+        // Convert Metal poly to SIMD
+        let cpu_coeffs = poly.coeffs.to_cpu();
+        let simd_coeffs: BaseColumn = cpu_coeffs.into_iter().collect();
+        let simd_poly = CircleCoefficients::new(simd_coeffs);
+
+        // Twiddles can be transmuted (same structure)
         let simd_twiddles: &TwiddleTree<SimdBackend> =
             unsafe { &*(twiddles as *const _ as *const _) };
-        let simd_result = SimdBackend::evaluate(simd_poly, domain, simd_twiddles);
-        return CircleEvaluation::new(simd_result.domain, simd_result.values);
+        let simd_result = SimdBackend::evaluate(&simd_poly, domain, simd_twiddles);
+
+        // Convert result back to Metal
+        let cpu_vals = simd_result.values.to_cpu();
+        let metal_col: MetalBaseColumn = cpu_vals.into_iter().collect();
+        return CircleEvaluation::new(simd_result.domain, metal_col);
     }
 
     let ctx = MetalContext::global();
@@ -266,8 +296,8 @@ fn metal_fft_dispatch(
     let poly_size = poly.coeffs.len();
     let eval_size = domain.size();
 
-    // Get input coefficients
-    let input_coeffs = poly.coeffs.to_cpu();
+    // Access input coefficients directly from GPU buffer (zero-copy with MTLStorageModeShared)
+    let input_coeffs = poly.coeffs.as_slice();
 
     // Allocate output buffer for all subdomains (shared memory, accessible from CPU/GPU)
     let device = ctx.device();
@@ -329,15 +359,9 @@ fn metal_fft_dispatch(
     command_buffer.commit();
     command_buffer.wait_until_completed();
 
-    // Access results directly from shared buffer (no copy needed - MTLStorageModeShared)
-    let result_vec: Vec<BaseField> = unsafe {
-        std::slice::from_raw_parts(
-            output_buffer.contents() as *const BaseField,
-            eval_size,
-        ).to_vec()
-    };
-
-    CircleEvaluation::new(domain, result_vec.into_iter().collect())
+    // Wrap GPU buffer directly - zero copy with MTLStorageModeShared
+    let result_col = MetalBaseColumn::from_buffer(output_buffer.clone(), eval_size);
+    CircleEvaluation::new(domain, result_col)
 }
 
 /// Process FFT using an existing encoder (for batching multiple FFTs).
@@ -359,8 +383,8 @@ fn metal_fft_batched_prepare(
     let poly_size = poly.coeffs.len();
     let eval_size = domain.size();
 
-    // Get input coefficients
-    let input_coeffs = poly.coeffs.to_cpu();
+    // Access input coefficients directly from GPU buffer (zero-copy with MTLStorageModeShared)
+    let input_coeffs = poly.coeffs.as_slice();
 
     // Allocate output buffer for this polynomial
     let output_buffer = device.new_buffer(
@@ -711,29 +735,35 @@ fn metal_ifft_dispatch(
     // Only fall back to SIMD if the size is too small
     // We can handle any number of non-vecwise layers using radix-2
     if log_size < MIN_FFT_LOG_SIZE {
-        let simd_eval = CircleEvaluation::new(eval.domain, eval.values);
+        use crate::prover::backend::Column;
+        use crate::prover::backend::simd::column::BaseColumn;
+
+        // Convert Metal eval to SIMD
+        let cpu_vals = eval.values.to_cpu();
+        let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+        let simd_eval = CircleEvaluation::new(eval.domain, simd_col);
+
         let simd_twiddles = TwiddleTree {
             root_coset: twiddles.root_coset,
             twiddles: twiddles.twiddles.clone(),
             itwiddles: twiddles.itwiddles.clone(),
         };
         let simd_result = SimdBackend::interpolate(simd_eval, &simd_twiddles);
-        return CircleCoefficients::new(simd_result.coeffs);
+
+        // Convert result back to Metal
+        let cpu_coeffs = simd_result.coeffs.to_cpu();
+        let metal_coeffs: MetalBaseColumn = cpu_coeffs.into_iter().collect();
+        return CircleCoefficients::new(metal_coeffs);
     }
 
     let ctx = MetalContext::global();
     let device = ctx.device();
 
-    // Get raw data
-    let data_vec = eval.values.to_cpu();
-    let data_len = data_vec.len();
+    let data_len = eval.values.len();
 
-    // Create Metal buffer
-    let data_buffer = device.new_buffer_with_data(
-        data_vec.as_ptr() as *const _,
-        (data_len * std::mem::size_of::<BaseField>()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    // IFFT operates in-place on the eval buffer
+    // Since eval.values is already a MetalBaseColumn with a shared buffer, use it directly (zero-copy)
+    let data_buffer = eval.values.buffer().clone();
 
     // Convert flat inverse twiddles to per-layer slices
     let itwiddle_slices = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
@@ -925,15 +955,9 @@ fn metal_ifft_dispatch(
         // current_layer += 3;  // Unused since radix-8 is disabled
     }
 
-    // Access results directly from shared buffer (no copy needed - MTLStorageModeShared)
-    let result_vec: Vec<BaseField> = unsafe {
-        std::slice::from_raw_parts(
-            data_buffer.contents() as *const BaseField,
-            data_len,
-        ).to_vec()
-    };
-
-    CircleCoefficients::new(result_vec.into_iter().collect())
+    // Wrap GPU buffer directly - zero copy with MTLStorageModeShared
+    let result_col = MetalBaseColumn::from_buffer(data_buffer.clone(), data_len);
+    CircleCoefficients::new(result_col)
 }
 
 #[cfg(test)]

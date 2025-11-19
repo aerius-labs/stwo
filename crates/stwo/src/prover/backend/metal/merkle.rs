@@ -158,12 +158,23 @@ impl MerkleOps<Blake2sMerkleHasher> for MetalBackend {
         // Fall back to SIMD for small sizes or when columns are present
         // (column hashing not yet implemented in Metal)
         if log_size < MIN_MERKLE_LOG_SIZE || !columns.is_empty() || prev_layer.is_none() {
-            let simd_columns: &[&Col<SimdBackend, BaseField>] =
-                unsafe { &*(columns as *const _ as *const _) };
+            use crate::prover::backend::Column;
+            use crate::prover::backend::simd::column::BaseColumn;
+
+            // Convert Metal columns to SIMD
+            let simd_columns_owned: Vec<BaseColumn> = columns
+                .iter()
+                .map(|col| {
+                    let cpu_vals = col.to_cpu();
+                    cpu_vals.into_iter().collect()
+                })
+                .collect();
+            let simd_columns_refs: Vec<&BaseColumn> = simd_columns_owned.iter().collect();
+
             return <SimdBackend as MerkleOps<Blake2sMerkleHasher>>::commit_on_layer(
                 log_size,
                 prev_layer,
-                simd_columns,
+                &simd_columns_refs,
             );
         }
 
@@ -274,12 +285,23 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
     ) -> Vec<Blake2sHash> {
         // Fall back to SIMD for small sizes or when columns are present
         if log_size < MIN_MERKLE_LOG_SIZE || !columns.is_empty() || prev_layer.is_none() {
-            let simd_columns: &[&Col<SimdBackend, BaseField>] =
-                unsafe { &*(columns as *const _ as *const _) };
+            use crate::prover::backend::Column;
+            use crate::prover::backend::simd::column::BaseColumn;
+
+            // Convert Metal columns to SIMD
+            let simd_columns_owned: Vec<BaseColumn> = columns
+                .iter()
+                .map(|col| {
+                    let cpu_vals = col.to_cpu();
+                    cpu_vals.into_iter().collect()
+                })
+                .collect();
+            let simd_columns_refs: Vec<&BaseColumn> = simd_columns_owned.iter().collect();
+
             return <SimdBackend as MerkleOps<Blake2sM31MerkleHasher>>::commit_on_layer(
                 log_size,
                 prev_layer,
-                simd_columns,
+                &simd_columns_refs,
             );
         }
 

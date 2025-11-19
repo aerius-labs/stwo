@@ -17,6 +17,7 @@ use super::context::MetalContext;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::prover::backend::{Column, CpuBackend};
+use crate::prover::backend::simd::SimdBackend;
 use crate::prover::secure_column::SecureColumnByCoords;
 
 /// Metal-backed column for base field elements (M31).
@@ -31,10 +32,9 @@ pub struct MetalBaseColumn {
     len: usize,
 }
 
-#[allow(dead_code)]
 impl MetalBaseColumn {
     /// Create a new column from a Metal buffer.
-    fn from_buffer(buffer: Buffer, len: usize) -> Self {
+    pub fn from_buffer(buffer: Buffer, len: usize) -> Self {
         Self { buffer, len }
     }
 
@@ -44,13 +44,13 @@ impl MetalBaseColumn {
     }
 
     /// Get a slice view of the data (CPU-accessible).
-    fn as_slice(&self) -> &[BaseField] {
+    pub fn as_slice(&self) -> &[BaseField] {
         let ptr = self.buffer.contents() as *const BaseField;
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }
 
     /// Get a mutable slice view of the data (CPU-accessible).
-    fn as_mut_slice(&mut self) -> &mut [BaseField] {
+    pub fn as_mut_slice(&mut self) -> &mut [BaseField] {
         let ptr = self.buffer.contents() as *mut BaseField;
         unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
     }
@@ -177,10 +177,9 @@ pub struct MetalSecureColumn {
     len: usize,
 }
 
-#[allow(dead_code)]
 impl MetalSecureColumn {
     /// Create a new column from a Metal buffer.
-    fn from_buffer(buffer: Buffer, len: usize) -> Self {
+    pub fn from_buffer(buffer: Buffer, len: usize) -> Self {
         Self { buffer, len }
     }
 
@@ -190,13 +189,13 @@ impl MetalSecureColumn {
     }
 
     /// Get a slice view of the data (CPU-accessible).
-    fn as_slice(&self) -> &[SecureField] {
+    pub fn as_slice(&self) -> &[SecureField] {
         let ptr = self.buffer.contents() as *const SecureField;
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }
 
     /// Get a mutable slice view of the data (CPU-accessible).
-    fn as_mut_slice(&mut self) -> &mut [SecureField] {
+    pub fn as_mut_slice(&mut self) -> &mut [SecureField] {
         let ptr = self.buffer.contents() as *mut SecureField;
         unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
     }
@@ -318,6 +317,17 @@ impl SecureColumnByCoords<MetalBackend> {
     pub fn from_cpu(cpu: SecureColumnByCoords<CpuBackend>) -> Self {
         Self {
             columns: cpu.columns.map(|col| col.into_iter().collect()),
+        }
+    }
+
+    /// Convert from SIMD SecureColumnByCoords to Metal SecureColumnByCoords
+    pub fn from_simd(simd: SecureColumnByCoords<SimdBackend>) -> Self {
+        use crate::prover::backend::Column;
+        Self {
+            columns: simd.columns.map(|col| {
+                let cpu_vals = col.to_cpu();
+                cpu_vals.into_iter().collect()
+            }),
         }
     }
 }

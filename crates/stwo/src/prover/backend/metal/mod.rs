@@ -41,14 +41,9 @@ mod buffer_pool;
 #[cfg(target_os = "macos")]
 pub use context::{MetalContext, MetalContextHandle};
 
-// NOTE: MetalBaseColumn/MetalSecureColumn are NOT exported because they're not
-// used in Phase 1. ColumnOps uses SIMD's BaseColumn/SecureColumn instead.
-// These types exist in column.rs for future Phase 2 optimization but exporting
-// them would create confusion about which column types are actually in use.
-//
-// To use them in Phase 2: uncomment the export below and switch ColumnOps.
-// #[cfg(target_os = "macos")]
-// pub use column::{MetalBaseColumn, MetalSecureColumn};
+// Export Metal column types (now actively used)
+#[cfg(target_os = "macos")]
+pub use column::{MetalBaseColumn, MetalSecureColumn};
 
 #[cfg(target_os = "macos")]
 use serde::{Deserialize, Serialize};
@@ -58,10 +53,6 @@ use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 #[cfg(target_os = "macos")]
 use crate::core::vcs::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sMerkleChannel};
-#[cfg(target_os = "macos")]
-use crate::prover::backend::simd::column::{BaseColumn, SecureColumn};
-#[cfg(target_os = "macos")]
-use crate::prover::backend::simd::SimdBackend;
 #[cfg(target_os = "macos")]
 use crate::prover::backend::{Backend, BackendForChannel, ColumnOps};
 
@@ -152,19 +143,23 @@ impl BackendForChannel<Blake2sM31MerkleChannel> for MetalBackend {}
 
 #[cfg(target_os = "macos")]
 impl ColumnOps<BaseField> for MetalBackend {
-    type Column = BaseColumn;
+    type Column = MetalBaseColumn;
 
     fn bit_reverse_column(column: &mut Self::Column) {
-        <SimdBackend as ColumnOps<BaseField>>::bit_reverse_column(column)
+        use crate::core::utils::bit_reverse;
+        let slice = column.as_mut_slice();
+        bit_reverse(slice);
     }
 }
 
 #[cfg(target_os = "macos")]
 impl ColumnOps<SecureField> for MetalBackend {
-    type Column = SecureColumn;
+    type Column = MetalSecureColumn;
 
     fn bit_reverse_column(column: &mut Self::Column) {
-        <SimdBackend as ColumnOps<SecureField>>::bit_reverse_column(column)
+        use crate::core::utils::bit_reverse;
+        let slice = column.as_mut_slice();
+        bit_reverse(slice);
     }
 }
 

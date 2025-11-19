@@ -65,14 +65,27 @@ impl FriOps for MetalBackend {
 
         // Fall back to SIMD for small sizes
         if log_size < MIN_FRI_LOG_SIZE {
-            let simd_eval: &LineEvaluation<SimdBackend> =
-                unsafe { &*(eval as *const _ as *const _) };
+            use crate::prover::backend::Column;
+            use crate::prover::backend::simd::column::BaseColumn;
+            use crate::prover::secure_column::SecureColumnByCoords;
+
+            // Convert Metal eval to SIMD
+            let simd_columns = eval.values.columns.clone().map(|col| {
+                let cpu_vals = col.to_cpu();
+                let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+                simd_col
+            });
+            let simd_values = SecureColumnByCoords { columns: simd_columns };
+            let simd_eval = LineEvaluation::new(eval.domain(), simd_values);
+
             let simd_twiddles: &TwiddleTree<SimdBackend> =
                 unsafe { &*(twiddles as *const _ as *const _) };
-            let simd_result = SimdBackend::fold_line(simd_eval, alpha, simd_twiddles);
-            let metal_result: LineEvaluation<MetalBackend> =
-                unsafe { std::mem::transmute(simd_result) };
-            return metal_result;
+            let simd_result = SimdBackend::fold_line(&simd_eval, alpha, simd_twiddles);
+
+            // Convert result back to Metal
+            let domain = simd_result.domain();
+            let metal_values = SecureColumnByCoords::from_simd(simd_result.values);
+            return LineEvaluation::new(domain, metal_values);
         }
 
         let ctx = MetalContext::global();
@@ -156,13 +169,34 @@ impl FriOps for MetalBackend {
 
         // Fall back to SIMD for small sizes
         if log_size < MIN_FRI_LOG_SIZE {
-            let simd_dst: &mut LineEvaluation<SimdBackend> =
-                unsafe { &mut *(dst as *mut _ as *mut _) };
-            let simd_src: &SecureEvaluation<SimdBackend, BitReversedOrder> =
-                unsafe { &*(src as *const _ as *const _) };
+            use crate::prover::backend::Column;
+            use crate::prover::backend::simd::column::BaseColumn;
+
+            // Convert dst and src from Metal to SIMD
+            let dst_domain = dst.domain();
+            let simd_dst_columns = dst.values.columns.clone().map(|col| {
+                let cpu_vals = col.to_cpu();
+                let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+                simd_col
+            });
+            let simd_dst_values = SecureColumnByCoords { columns: simd_dst_columns };
+            let mut simd_dst = LineEvaluation::new(dst_domain, simd_dst_values);
+
+            let simd_src_columns = src.values.columns.clone().map(|col| {
+                let cpu_vals = col.to_cpu();
+                let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+                simd_col
+            });
+            let simd_src_values = SecureColumnByCoords { columns: simd_src_columns };
+            let simd_src = SecureEvaluation::new(src.domain, simd_src_values);
+
             let simd_twiddles: &TwiddleTree<SimdBackend> =
                 unsafe { &*(twiddles as *const _ as *const _) };
-            SimdBackend::fold_circle_into_line(simd_dst, simd_src, alpha, simd_twiddles);
+
+            SimdBackend::fold_circle_into_line(&mut simd_dst, &simd_src, alpha, simd_twiddles);
+
+            // Write result back to dst
+            dst.values = SecureColumnByCoords::from_simd(simd_dst.values);
             return;
         }
 
@@ -248,13 +282,24 @@ impl FriOps for MetalBackend {
     fn decompose(
         eval: &SecureEvaluation<Self, BitReversedOrder>,
     ) -> (SecureEvaluation<Self, BitReversedOrder>, SecureField) {
-        // Decomposition uses SIMD
-        let simd_eval: &SecureEvaluation<SimdBackend, BitReversedOrder> =
-            unsafe { &*(eval as *const _ as *const _) };
-        let (simd_result, field) = SimdBackend::decompose(simd_eval);
-        // Transmute result back
-        let metal_result: SecureEvaluation<MetalBackend, BitReversedOrder> =
-            unsafe { std::mem::transmute(simd_result) };
+        use crate::prover::backend::Column;
+        use crate::prover::backend::simd::column::BaseColumn;
+        use crate::prover::secure_column::SecureColumnByCoords;
+
+        // Convert Metal eval to SIMD
+        let simd_columns = eval.values.columns.clone().map(|col| {
+            let cpu_vals = col.to_cpu();
+            let simd_col: BaseColumn = cpu_vals.into_iter().collect();
+            simd_col
+        });
+        let simd_values = SecureColumnByCoords { columns: simd_columns };
+        let simd_eval = SecureEvaluation::new(eval.domain, simd_values);
+
+        let (simd_result, field) = SimdBackend::decompose(&simd_eval);
+
+        // Convert result back to Metal
+        let metal_values = SecureColumnByCoords::from_simd(simd_result.values);
+        let metal_result = SecureEvaluation::new(simd_result.domain, metal_values);
         (metal_result, field)
     }
 }
