@@ -53,12 +53,10 @@ impl MleOps<BaseField> for MetalBackend {
             MTLResourceOptions::StorageModeShared,
         );
 
-        let output_data_zeros = vec![0u32; output_len * 4]; // QM31 = 4 x u32
-        let output_buffer = device.new_buffer_with_data(
-            output_data_zeros.as_ptr() as *const _,
-            (output_len * 4 * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // Allocate output buffer directly (GPU will write all values, no need to zero-initialize on CPU)
+        let output_size = (output_len * 4 * std::mem::size_of::<u32>()) as u64;
+        let output_pooled = ctx.checkout_shared_buffer(output_size);
+        let output_buffer = output_pooled.buffer();
 
         // Create assignment buffer (QM31)
         let assignment_data = assignment.to_m31_array().map(|m| m.0);
@@ -158,12 +156,10 @@ impl MleOps<SecureField> for MetalBackend {
             MTLResourceOptions::StorageModeShared,
         );
 
-        let output_data_zeros = vec![0u32; output_len * 4];
-        let output_buffer = device.new_buffer_with_data(
-            output_data_zeros.as_ptr() as *const _,
-            (output_len * 4 * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // Allocate output buffer directly (GPU will write all values, no need to zero-initialize on CPU)
+        let output_size = (output_len * 4 * std::mem::size_of::<u32>()) as u64;
+        let output_pooled = ctx.checkout_shared_buffer(output_size);
+        let output_buffer = output_pooled.buffer();
 
         // Create assignment buffer (QM31)
         let assignment_data = assignment.to_m31_array().map(|m| m.0);
@@ -213,6 +209,9 @@ impl MleOps<SecureField> for MetalBackend {
                 SecureField::from_m31(a, b, c, d)
             })
             .collect();
+
+        // Keep pooled buffer alive until after GPU completes and data is read
+        drop(output_pooled);
 
         Mle::new(result_values.into_iter().collect())
     }

@@ -67,25 +67,39 @@ impl QuotientOps for MetalBackend {
         let ctx = MetalContext::global();
         let (domain_x_buffer, domain_y_buffer) = ctx.get_or_create_domain_xy_buffers(domain);
 
-        // Flatten column data (each column has domain_size M31 values)
-        // Optimized: direct buffer copy instead of nested loops
+        // Get device and command queue for GPU operations
+        let device = ctx.device();
+        let command_queue = ctx.command_queue();
+
+        // Flatten column data using GPU blit encoder (avoids GPU→CPU→GPU round-trip)
         let _flatten_timer = std::time::Instant::now();
-        let mut columns_data: Vec<u32> = Vec::with_capacity(num_columns * domain_size);
-        unsafe {
-            columns_data.set_len(num_columns * domain_size);
-            let mut offset = 0;
-            for col in columns {
-                let col_slice = col.values.as_slice();
-                std::ptr::copy_nonoverlapping(
-                    col_slice.as_ptr() as *const u32,
-                    columns_data.as_mut_ptr().add(offset),
-                    domain_size,
-                );
-                offset += domain_size;
-            }
+        let columns_buffer_size = (num_columns * domain_size * std::mem::size_of::<u32>()) as u64;
+        let columns_pooled = ctx.checkout_shared_buffer(columns_buffer_size);
+        let columns_buffer = columns_pooled.buffer();
+
+        // Use blit encoder to copy column buffers on GPU
+        let flatten_cmd = command_queue.new_command_buffer();
+        let blit_encoder = flatten_cmd.new_blit_command_encoder();
+
+        let mut offset = 0u64;
+        let col_size = (domain_size * std::mem::size_of::<u32>()) as u64;
+        for col in columns {
+            blit_encoder.copy_from_buffer(
+                col.values.buffer(),
+                0,
+                &columns_buffer,
+                offset,
+                col_size,
+            );
+            offset += col_size;
         }
+
+        blit_encoder.end_encoding();
+        flatten_cmd.commit();
+        flatten_cmd.wait_until_completed();
+
         if std::env::var("METAL_PROFILE").is_ok() {
-            eprintln!("[CPU_PROFILE] quotient_flatten | num_columns={}, domain_size={} | time={:.3}ms", num_columns, domain_size, _flatten_timer.elapsed().as_secs_f64() * 1000.0);
+            eprintln!("[GPU_PROFILE] quotient_flatten_blit | num_columns={}, domain_size={} | time={:.3}ms", num_columns, domain_size, _flatten_timer.elapsed().as_secs_f64() * 1000.0);
         }
 
         // Flatten line coefficients and build metadata
@@ -142,16 +156,7 @@ impl QuotientOps for MetalBackend {
         }
 
         // Dispatch to Metal GPU
-        let device = ctx.device();
-        let command_queue = ctx.command_queue();
-
-        // Create buffers (domain x/y already cached)
-
-        let columns_buffer = device.new_buffer_with_data(
-            columns_data.as_ptr() as *const _,
-            (columns_data.len() * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // (columns_buffer already created via GPU blit above, device/command_queue already obtained)
 
         let column_indices_buffer = device.new_buffer_with_data(
             column_indices.as_ptr() as *const _,
@@ -234,7 +239,8 @@ impl QuotientOps for MetalBackend {
             SecureColumnByCoords::from_qm31_interleaved_buffer(&output_buffer, domain_size)
         };
 
-        // Keep pooled buffer alive until after GPU completes and data is read
+        // Keep pooled buffers alive until after GPU completes and data is read
+        drop(columns_pooled);
         drop(output_pooled);
 
         SecureEvaluation::new(domain, values)
