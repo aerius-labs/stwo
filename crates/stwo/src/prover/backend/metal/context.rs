@@ -510,6 +510,59 @@ impl MetalContext {
             super::column::MetalBaseColumn::from_buffer(cols[3].clone(), len),
         ]
     }
+
+    /// Pack coords to QM31 using an existing encoder (non-blocking, for batching).
+    pub fn pack_coords_to_qm31_batched(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        col0: &super::column::MetalBaseColumn,
+        col1: &super::column::MetalBaseColumn,
+        col2: &super::column::MetalBaseColumn,
+        col3: &super::column::MetalBaseColumn,
+        out: &Buffer,
+    ) {
+        let len = col0.len();
+        encoder.set_compute_pipeline_state(&self.pack_coords_to_qm31_pipeline);
+        encoder.set_buffer(0, Some(col0.buffer()), 0);
+        encoder.set_buffer(1, Some(col1.buffer()), 0);
+        encoder.set_buffer(2, Some(col2.buffer()), 0);
+        encoder.set_buffer(3, Some(col3.buffer()), 0);
+        encoder.set_buffer(4, Some(out), 0);
+        let len_u32 = len as u32;
+        encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &len_u32 as *const u32 as *const _);
+
+        let tg_size = 256.min(len as u64);
+        let groups = ((len as u64 + tg_size - 1) / tg_size).max(1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(groups, 1, 1),
+            metal::MTLSize::new(tg_size, 1, 1),
+        );
+    }
+
+    /// Unpack QM31 using an existing encoder (non-blocking, for batching).
+    pub fn unpack_qm31_to_coords_batched(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        src: &Buffer,
+        cols: &[Buffer; 4],
+        len: usize,
+    ) {
+        encoder.set_compute_pipeline_state(&self.unpack_qm31_to_coords_pipeline);
+        encoder.set_buffer(0, Some(src), 0);
+        encoder.set_buffer(1, Some(&cols[0]), 0);
+        encoder.set_buffer(2, Some(&cols[1]), 0);
+        encoder.set_buffer(3, Some(&cols[2]), 0);
+        encoder.set_buffer(4, Some(&cols[3]), 0);
+        let len_u32 = len as u32;
+        encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &len_u32 as *const u32 as *const _);
+
+        let tg_size = 256.min(len as u64);
+        let groups = ((len as u64 + tg_size - 1) / tg_size).max(1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(groups, 1, 1),
+            metal::MTLSize::new(tg_size, 1, 1),
+        );
+    }
 }
 
 /// Thread-safe handle to the Metal context.

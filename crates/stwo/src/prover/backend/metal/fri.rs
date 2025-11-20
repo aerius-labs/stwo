@@ -59,19 +59,31 @@ impl FriOps for MetalBackend {
         let domain = eval.domain();
         let itwiddles = domain_line_twiddles_from_tree(domain, &twiddles.itwiddles)[0];
 
-        // Convert input to interleaved QM31 layout - zero-copy via shared buffer
-        let input_buffer = eval.values.as_qm31_interleaved_u32_buffer();
+        let input_len = 1 << log_size;
         let output_len = 1 << (log_size - 1);
 
-        // Create output buffer using buffer pool
-        let output_size = (output_len * 4 * std::mem::size_of::<u32>()) as u64;
-        let output_pooled = ctx.checkout_shared_buffer(output_size);
-        let output_buffer = output_pooled.buffer();
+        // Allocate buffers for batched operation
+        let input_qm31_size = (input_len * 4 * std::mem::size_of::<u32>()) as u64;
+        let input_qm31_buffer = device.new_buffer(
+            input_qm31_size,
+            MTLResourceOptions::StorageModeShared,
+        );
 
-        // Twiddles are M31 (u32) in doubled format - use cache
+        let output_qm31_size = (output_len * 4 * std::mem::size_of::<u32>()) as u64;
+        let output_pooled = ctx.checkout_shared_buffer(output_qm31_size);
+        let output_qm31_buffer = output_pooled.buffer();
+
+        // Pre-allocate output coordinate buffers for unpack
+        let coord_size = (output_len * std::mem::size_of::<u32>()) as u64;
+        let out_cols = [
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+        ];
+
+        // Twiddles and alpha
         let twiddle_buffer = ctx.get_or_create_twiddle_buffer(itwiddles);
-
-        // Create alpha buffer (QM31)
         let alpha_data = alpha.to_m31_array().map(|m| m.0);
         let alpha_buffer = device.new_buffer_with_data(
             alpha_data.as_ptr() as *const _,
@@ -79,12 +91,24 @@ impl FriOps for MetalBackend {
             MTLResourceOptions::StorageModeShared,
         );
 
-        // Dispatch kernel
+        // Batch pack → FRI kernel → unpack into single command buffer
         let command_buffer = ctx.command_queue().new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
+
+        // 1. Pack input coords to QM31
+        ctx.pack_coords_to_qm31_batched(
+            &encoder,
+            &eval.values.columns[0],
+            &eval.values.columns[1],
+            &eval.values.columns[2],
+            &eval.values.columns[3],
+            &input_qm31_buffer,
+        );
+
+        // 2. FRI fold kernel
         encoder.set_compute_pipeline_state(ctx.fri_fold_line_pipeline());
-        encoder.set_buffer(0, Some(&input_buffer), 0);
-        encoder.set_buffer(1, Some(&output_buffer), 0);
+        encoder.set_buffer(0, Some(&input_qm31_buffer), 0);
+        encoder.set_buffer(1, Some(&output_qm31_buffer), 0);
         encoder.set_buffer(2, Some(&twiddle_buffer), 0);
         encoder.set_buffer(3, Some(&alpha_buffer), 0);
         encoder.set_bytes(4, std::mem::size_of::<u32>() as u64, &log_size as *const u32 as *const _);
@@ -98,16 +122,24 @@ impl FriOps for MetalBackend {
             metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
         );
 
+        // 3. Unpack output QM31 to coords
+        ctx.unpack_qm31_to_coords_batched(
+            &encoder,
+            &output_qm31_buffer,
+            &out_cols,
+            output_len,
+        );
+
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
 
-        // Convert output buffer directly to SecureColumnByCoords - zero-copy
-        let folded_values = unsafe {
-            SecureColumnByCoords::from_qm31_interleaved_buffer(&output_buffer, output_len)
+        // Convert output buffers to Metal columns
+        use crate::prover::backend::metal::column::MetalBaseColumn;
+        let folded_values = SecureColumnByCoords {
+            columns: out_cols.map(|buf| MetalBaseColumn::from_buffer(buf, output_len)),
         };
 
-        // Keep pooled buffer alive until after GPU completes and data is read
         drop(output_pooled);
 
         LineEvaluation::new(domain.double(), folded_values)
@@ -163,15 +195,33 @@ impl FriOps for MetalBackend {
         let alpha_sq = alpha * alpha;
         let itwiddles = domain_line_twiddles_from_tree(domain, &twiddles.itwiddles)[0];
 
-        // Convert source and dst to interleaved QM31 layout - zero-copy via shared buffer
-        let src_buffer = src.values.as_qm31_interleaved_u32_buffer();
-        let dst_buffer = dst.values.as_qm31_interleaved_u32_buffer();
+        let src_len = 1 << log_size;
         let output_len = 1 << (log_size - 1);
 
-        // Twiddles are M31 (u32) in doubled format - use cache
-        let twiddle_buffer = ctx.get_or_create_twiddle_buffer(itwiddles);
+        // Allocate buffers for batched operation
+        let src_qm31_size = (src_len * 4 * std::mem::size_of::<u32>()) as u64;
+        let src_qm31_buffer = device.new_buffer(
+            src_qm31_size,
+            MTLResourceOptions::StorageModeShared,
+        );
 
-        // Create alpha and alpha_sq buffers (QM31)
+        let dst_qm31_size = (output_len * 4 * std::mem::size_of::<u32>()) as u64;
+        let dst_qm31_buffer = device.new_buffer(
+            dst_qm31_size,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Pre-allocate output coordinate buffers for unpack
+        let coord_size = (output_len * std::mem::size_of::<u32>()) as u64;
+        let out_cols = [
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+        ];
+
+        // Twiddles and alpha
+        let twiddle_buffer = ctx.get_or_create_twiddle_buffer(itwiddles);
         let alpha_data = alpha.to_m31_array().map(|m| m.0);
         let alpha_buffer = device.new_buffer_with_data(
             alpha_data.as_ptr() as *const _,
@@ -186,12 +236,34 @@ impl FriOps for MetalBackend {
             MTLResourceOptions::StorageModeShared,
         );
 
-        // Dispatch kernel
+        // Batch pack src → pack dst → FRI kernel → unpack into single command buffer
         let command_buffer = ctx.command_queue().new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
+
+        // 1. Pack src coords to QM31
+        ctx.pack_coords_to_qm31_batched(
+            &encoder,
+            &src.values.columns[0],
+            &src.values.columns[1],
+            &src.values.columns[2],
+            &src.values.columns[3],
+            &src_qm31_buffer,
+        );
+
+        // 2. Pack dst coords to QM31 (input for accumulation)
+        ctx.pack_coords_to_qm31_batched(
+            &encoder,
+            &dst.values.columns[0],
+            &dst.values.columns[1],
+            &dst.values.columns[2],
+            &dst.values.columns[3],
+            &dst_qm31_buffer,
+        );
+
+        // 3. FRI fold_circle kernel
         encoder.set_compute_pipeline_state(ctx.fri_fold_circle_pipeline());
-        encoder.set_buffer(0, Some(&src_buffer), 0);
-        encoder.set_buffer(1, Some(&dst_buffer), 0);
+        encoder.set_buffer(0, Some(&src_qm31_buffer), 0);
+        encoder.set_buffer(1, Some(&dst_qm31_buffer), 0);
         encoder.set_buffer(2, Some(&twiddle_buffer), 0);
         encoder.set_buffer(3, Some(&alpha_buffer), 0);
         encoder.set_buffer(4, Some(&alpha_sq_buffer), 0);
@@ -206,13 +278,22 @@ impl FriOps for MetalBackend {
             metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
         );
 
+        // 4. Unpack output QM31 to coords
+        ctx.unpack_qm31_to_coords_batched(
+            &encoder,
+            &dst_qm31_buffer,
+            &out_cols,
+            output_len,
+        );
+
         encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
 
-        // Convert output buffer directly to SecureColumnByCoords - zero-copy
-        dst.values = unsafe {
-            SecureColumnByCoords::from_qm31_interleaved_buffer(&dst_buffer, output_len)
+        // Convert output buffers to Metal columns
+        use crate::prover::backend::metal::column::MetalBaseColumn;
+        dst.values = SecureColumnByCoords {
+            columns: out_cols.map(|buf| MetalBaseColumn::from_buffer(buf, output_len)),
         };
     }
 
