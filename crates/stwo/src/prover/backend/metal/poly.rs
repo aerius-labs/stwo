@@ -163,6 +163,7 @@ impl PolyOps for MetalBackend {
         let mut metal_results = Vec::new();
         let mut metal_buffers = Vec::new();  // Keep buffers alive
         if !metal_batch.is_empty() {
+            let _setup_timer = std::time::Instant::now();
             let ctx = MetalContext::global();
             let device = ctx.device();
             let command_buffer = ctx.command_queue().new_command_buffer();
@@ -174,11 +175,19 @@ impl PolyOps for MetalBackend {
                 let buffer = metal_fft_batched_prepare(&ctx, &device, &encoder, &poly_coeffs, domain, twiddles);
                 metal_buffers.push((domain, buffer));
             }
+            if std::env::var("METAL_PROFILE").is_ok() {
+                eprintln!("[CPU_PROFILE] fft_batch_setup | num_polys={} | time={:.3}ms", metal_batch.len(), _setup_timer.elapsed().as_secs_f64() * 1000.0);
+            }
 
             // Submit all Metal operations at once
             encoder.end_encoding();
             command_buffer.commit();
+
+            let _gpu_wait = std::time::Instant::now();
             command_buffer.wait_until_completed();
+            if std::env::var("METAL_PROFILE").is_ok() {
+                eprintln!("[CPU_PROFILE] fft_batch_gpu_wait | num_polys={} | time={:.3}ms", metal_batch.len(), _gpu_wait.elapsed().as_secs_f64() * 1000.0);
+            }
 
             // Second pass: wrap results from GPU buffers (zero-copy)
             for (poly_coeffs, (domain, output_buffer)) in metal_batch.into_iter().zip(metal_buffers.iter()) {

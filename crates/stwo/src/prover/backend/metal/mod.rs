@@ -74,7 +74,7 @@ pub mod thresholds {
     pub const MIN_FRI_LOG_SIZE: u32 = 12;
 
     /// Minimum log size for GPU Merkle operations.
-    pub const MIN_MERKLE_LOG_SIZE: u32 = 14;
+    pub const MIN_MERKLE_LOG_SIZE: u32 = 10;  // Lowered from 14 to enable GPU for more layers
 
     /// Minimum log size for GPU quotient accumulation.
     pub const MIN_QUOTIENT_LOG_SIZE: u32 = 12;

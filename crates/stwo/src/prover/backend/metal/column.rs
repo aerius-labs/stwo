@@ -394,68 +394,25 @@ impl SecureColumnByCoords<MetalBackend> {
     /// Layout: [a0, b0, c0, d0, a1, b1, c1, d1, ...]
     /// where each QM31 = {CM31(a,b), CM31(c,d)} and each M31 is stored as u32.
     ///
-    /// This writes directly into a Metal shared buffer, avoiding intermediate Vec allocations.
+    /// Uses GPU kernel to pack coordinate columns into interleaved format.
     pub fn as_qm31_interleaved_u32_buffer(&self) -> Buffer {
-        let len = self.len();
         let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        // Allocate output buffer (4 u32s per SecureField element)
-        let buffer_size = (len * 4 * std::mem::size_of::<u32>()) as u64;
-        let buffer = device.new_buffer(buffer_size, MTLResourceOptions::StorageModeShared);
-
-        // Get pointers to each coordinate column via zero-copy
-        let col0_slice = self.columns[0].as_slice();
-        let col1_slice = self.columns[1].as_slice();
-        let col2_slice = self.columns[2].as_slice();
-        let col3_slice = self.columns[3].as_slice();
-
-        // Write interleaved QM31 data directly to buffer
-        unsafe {
-            let dst = buffer.contents() as *mut u32;
-            for i in 0..len {
-                *dst.add(i * 4 + 0) = col0_slice[i].0;
-                *dst.add(i * 4 + 1) = col1_slice[i].0;
-                *dst.add(i * 4 + 2) = col2_slice[i].0;
-                *dst.add(i * 4 + 3) = col3_slice[i].0;
-            }
-        }
-
-        buffer
+        ctx.pack_coords_to_qm31(
+            &self.columns[0],
+            &self.columns[1],
+            &self.columns[2],
+            &self.columns[3],
+        )
     }
 
     /// Create a SecureColumnByCoords from an interleaved QM31 buffer.
     ///
     /// This is the inverse of `as_qm31_interleaved_u32_buffer`.
+    /// Uses GPU kernel to unpack interleaved format into coordinate columns.
     pub unsafe fn from_qm31_interleaved_buffer(buffer: &Buffer, len: usize) -> Self {
         let ctx = MetalContext::global();
-        let device = ctx.device();
-
-        // Create 4 separate column buffers
-        let columns = std::array::from_fn(|_| {
-            device.new_buffer(
-                (len * std::mem::size_of::<BaseField>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
-        });
-
-        // De-interleave QM31 buffer into 4 coordinate columns
-        let src = buffer.contents() as *const u32;
-        for i in 0..len {
-            let a = *src.add(i * 4 + 0);
-            let b = *src.add(i * 4 + 1);
-            let c = *src.add(i * 4 + 2);
-            let d = *src.add(i * 4 + 3);
-
-            *(columns[0].contents() as *mut u32).add(i) = a;
-            *(columns[1].contents() as *mut u32).add(i) = b;
-            *(columns[2].contents() as *mut u32).add(i) = c;
-            *(columns[3].contents() as *mut u32).add(i) = d;
-        }
-
-        Self {
-            columns: columns.map(|buf| MetalBaseColumn::from_buffer(buf, len)),
-        }
+        let columns = ctx.unpack_qm31_to_coords(buffer, len);
+        Self { columns }
     }
 }
 

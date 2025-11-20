@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::poly::circle::CircleDomain;
 use crate::core::utils::bit_reverse_index;
+use crate::prover::backend::Column;
 
 use super::shaders;
 use super::twiddle_manager::FlatTwiddleManager;
@@ -420,6 +421,91 @@ impl MetalContext {
     /// the same memory without explicit copies.
     pub fn shared_resource_options() -> MTLResourceOptions {
         MTLResourceOptions::StorageModeShared
+    }
+
+    /// Pack 4 coordinate columns into QM31 interleaved format using GPU.
+    ///
+    /// Layout: [a0, b0, c0, d0, a1, b1, c1, d1, ...]
+    /// where each QM31 = {CM31(a,b), CM31(c,d)} and each M31 is stored as u32.
+    ///
+    /// This replaces the CPU loop in `SecureColumnByCoords::as_qm31_interleaved_u32_buffer`.
+    pub fn pack_coords_to_qm31(
+        &self,
+        col0: &super::column::MetalBaseColumn,
+        col1: &super::column::MetalBaseColumn,
+        col2: &super::column::MetalBaseColumn,
+        col3: &super::column::MetalBaseColumn,
+    ) -> Buffer {
+        let len = col0.len();
+        let byte_size = (len * 4 * std::mem::size_of::<u32>()) as u64;
+        let pooled = self.checkout_shared_buffer(byte_size);
+        let out = pooled.buffer().clone();
+
+        let command_buffer = self.command_queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pack_coords_to_qm31_pipeline);
+        encoder.set_buffer(0, Some(col0.buffer()), 0);
+        encoder.set_buffer(1, Some(col1.buffer()), 0);
+        encoder.set_buffer(2, Some(col2.buffer()), 0);
+        encoder.set_buffer(3, Some(col3.buffer()), 0);
+        encoder.set_buffer(4, Some(&out), 0);
+        let len_u32 = len as u32;
+        encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &len_u32 as *const u32 as *const _);
+
+        let tg_size = 256.min(len as u64);
+        let groups = ((len as u64 + tg_size - 1) / tg_size).max(1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(groups, 1, 1),
+            metal::MTLSize::new(tg_size, 1, 1),
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        out
+    }
+
+    /// Unpack QM31 interleaved format into 4 coordinate columns using GPU.
+    ///
+    /// This is the inverse of `pack_coords_to_qm31`.
+    /// Replaces the CPU loop in `SecureColumnByCoords::from_qm31_interleaved_buffer`.
+    pub fn unpack_qm31_to_coords(
+        &self,
+        src: &Buffer,
+        len: usize,
+    ) -> [super::column::MetalBaseColumn; 4] {
+        let elem_bytes = std::mem::size_of::<u32>() as u64;
+        let pooled_cols: Vec<_> = (0..4)
+            .map(|_| self.checkout_shared_buffer(len as u64 * elem_bytes))
+            .collect();
+        let cols: Vec<Buffer> = pooled_cols.iter().map(|p| p.buffer().clone()).collect();
+
+        let command_buffer = self.command_queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.unpack_qm31_to_coords_pipeline);
+        encoder.set_buffer(0, Some(src), 0);
+        encoder.set_buffer(1, Some(&cols[0]), 0);
+        encoder.set_buffer(2, Some(&cols[1]), 0);
+        encoder.set_buffer(3, Some(&cols[2]), 0);
+        encoder.set_buffer(4, Some(&cols[3]), 0);
+        let len_u32 = len as u32;
+        encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &len_u32 as *const u32 as *const _);
+
+        let tg_size = 256.min(len as u64);
+        let groups = ((len as u64 + tg_size - 1) / tg_size).max(1);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize::new(groups, 1, 1),
+            metal::MTLSize::new(tg_size, 1, 1),
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        [
+            super::column::MetalBaseColumn::from_buffer(cols[0].clone(), len),
+            super::column::MetalBaseColumn::from_buffer(cols[1].clone(), len),
+            super::column::MetalBaseColumn::from_buffer(cols[2].clone(), len),
+            super::column::MetalBaseColumn::from_buffer(cols[3].clone(), len),
+        ]
     }
 }
 
