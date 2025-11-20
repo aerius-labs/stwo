@@ -183,11 +183,10 @@ impl QuotientOps for MetalBackend {
             MTLResourceOptions::StorageModeShared,
         );
 
-        // Output buffer (4 u32s per QM31, domain_size elements)
-        let output_buffer = device.new_buffer(
-            (domain_size * 4 * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // Output buffer (4 u32s per QM31, domain_size elements) using buffer pool
+        let output_size = (domain_size * 4 * std::mem::size_of::<u32>()) as u64;
+        let output_pooled = ctx.checkout_shared_buffer(output_size);
+        let output_buffer = output_pooled.buffer();
 
         // Dispatch kernel
         let command_buffer = command_queue.new_command_buffer();
@@ -234,6 +233,9 @@ impl QuotientOps for MetalBackend {
         let values = unsafe {
             SecureColumnByCoords::from_qm31_interleaved_buffer(&output_buffer, domain_size)
         };
+
+        // Keep pooled buffer alive until after GPU completes and data is read
+        drop(output_pooled);
 
         SecureEvaluation::new(domain, values)
     }

@@ -438,8 +438,8 @@ impl MetalContext {
     ) -> Buffer {
         let len = col0.len();
         let byte_size = (len * 4 * std::mem::size_of::<u32>()) as u64;
-        let pooled = self.checkout_shared_buffer(byte_size);
-        let out = pooled.buffer().clone();
+        // Create buffer directly without pool to avoid lifetime issues
+        let out = self.device().new_buffer(byte_size, MTLResourceOptions::StorageModeShared);
 
         let command_buffer = self.command_queue().new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -474,10 +474,13 @@ impl MetalContext {
         len: usize,
     ) -> [super::column::MetalBaseColumn; 4] {
         let elem_bytes = std::mem::size_of::<u32>() as u64;
-        let pooled_cols: Vec<_> = (0..4)
-            .map(|_| self.checkout_shared_buffer(len as u64 * elem_bytes))
+        // Create buffers directly without pool to avoid lifetime issues
+        let cols: Vec<Buffer> = (0..4)
+            .map(|_| self.device().new_buffer(
+                len as u64 * elem_bytes,
+                MTLResourceOptions::StorageModeShared,
+            ))
             .collect();
-        let cols: Vec<Buffer> = pooled_cols.iter().map(|p| p.buffer().clone()).collect();
 
         let command_buffer = self.command_queue().new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();

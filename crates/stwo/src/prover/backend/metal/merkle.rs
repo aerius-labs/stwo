@@ -203,11 +203,10 @@ impl MerkleOps<Blake2sMerkleHasher> for MetalBackend {
             MTLResourceOptions::StorageModeShared,
         );
 
-        // Allocate output buffer without zero-initialization (GPU will write all values)
-        let parents_buffer = device.new_buffer(
-            (num_parents * 8 * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // Allocate output buffer using buffer pool (GPU will write all values)
+        let parents_size = (num_parents * 8 * std::mem::size_of::<u32>()) as u64;
+        let parents_pooled = ctx.checkout_shared_buffer(parents_size);
+        let parents_buffer = parents_pooled.buffer();
 
         let is_m31_output: bool = false;
         let size_param = num_parents as u32;
@@ -275,6 +274,9 @@ impl MerkleOps<Blake2sMerkleHasher> for MetalBackend {
             result.push(Blake2sHash(hash_bytes));
         }
 
+        // Keep pooled buffer alive until after GPU completes and data is read
+        drop(parents_pooled);
+
         result
     }
 }
@@ -331,11 +333,10 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
             MTLResourceOptions::StorageModeShared,
         );
 
-        // Allocate output buffer without zero-initialization (GPU will write all values)
-        let parents_buffer = device.new_buffer(
-            (num_parents * 8 * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // Allocate output buffer using buffer pool (GPU will write all values)
+        let parents_size = (num_parents * 8 * std::mem::size_of::<u32>()) as u64;
+        let parents_pooled = ctx.checkout_shared_buffer(parents_size);
+        let parents_buffer = parents_pooled.buffer();
 
         let is_m31_output: bool = true; // M31 reduction enabled
         let size_param = num_parents as u32;
@@ -402,6 +403,9 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
             let hash_bytes: [u8; 32] = bytemuck::cast(hash_u32s);
             result.push(Blake2sHash(hash_bytes));
         }
+
+        // Keep pooled buffer alive until after GPU completes and data is read
+        drop(parents_pooled);
 
         result
     }

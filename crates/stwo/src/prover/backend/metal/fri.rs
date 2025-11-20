@@ -63,11 +63,10 @@ impl FriOps for MetalBackend {
         let input_buffer = eval.values.as_qm31_interleaved_u32_buffer();
         let output_len = 1 << (log_size - 1);
 
-        // Create output buffer
-        let output_buffer = device.new_buffer(
-            (output_len * 4 * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // Create output buffer using buffer pool
+        let output_size = (output_len * 4 * std::mem::size_of::<u32>()) as u64;
+        let output_pooled = ctx.checkout_shared_buffer(output_size);
+        let output_buffer = output_pooled.buffer();
 
         // Twiddles are M31 (u32) in doubled format - use cache
         let twiddle_buffer = ctx.get_or_create_twiddle_buffer(itwiddles);
@@ -107,6 +106,9 @@ impl FriOps for MetalBackend {
         let folded_values = unsafe {
             SecureColumnByCoords::from_qm31_interleaved_buffer(&output_buffer, output_len)
         };
+
+        // Keep pooled buffer alive until after GPU completes and data is read
+        drop(output_pooled);
 
         LineEvaluation::new(domain.double(), folded_values)
     }
