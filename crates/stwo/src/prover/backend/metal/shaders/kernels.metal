@@ -278,6 +278,13 @@ constant uint32_t BLAKE2S_NODE_INITIAL_STATE[8] = {
     0xfc6ef857, 0xb29da528, 0xc0d319c7, 0x8ae795c8
 };
 
+// Precomputed initial state for Merkle tree leaves
+// This is the state after compressing the LEAF_PREFIX ("leaf" + zeros)
+constant uint32_t BLAKE2S_LEAF_INITIAL_STATE[8] = {
+    0x3fa5003d, 0x8ff3be4a, 0x2b843d58, 0xe0766c2d,
+    0x5ca9b993, 0xa5c8cc74, 0x12f184e0, 0xd86f6c9e
+};
+
 // BLAKE2s message permutation schedule (SIGMA)
 constant uint8_t BLAKE2S_SIGMA[10][16] = {
     {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
@@ -617,6 +624,116 @@ kernel void fri_fold_circle_into_line(
     QM31 prev = dst[tid];
     QM31 scaled = qm31_mul(prev, alpha_sq);
     dst[tid] = qm31_add(scaled, folded);
+}
+
+/// Fused FRI fold_line kernel (coords → coords)
+/// Combines pack + fold + unpack into a single kernel to eliminate intermediate buffers
+///
+/// Parameters:
+/// - in_c0/c1/c2/c3: Input coordinate buffers (M31, length 2*N each)
+/// - out_c0/c1/c2/c3: Output coordinate buffers (M31, length N each)
+/// - itwiddles: Inverse twiddles (M31 doubled)
+/// - alpha: SecureField folding parameter (QM31)
+/// - log_size: log2(2*N)
+kernel void fri_fold_line_coords(
+    device const uint32_t* in_c0 [[buffer(0)]],
+    device const uint32_t* in_c1 [[buffer(1)]],
+    device const uint32_t* in_c2 [[buffer(2)]],
+    device const uint32_t* in_c3 [[buffer(3)]],
+    device uint32_t* out_c0 [[buffer(4)]],
+    device uint32_t* out_c1 [[buffer(5)]],
+    device uint32_t* out_c2 [[buffer(6)]],
+    device uint32_t* out_c3 [[buffer(7)]],
+    device const uint32_t* itwiddles [[buffer(8)]],
+    constant QM31& alpha [[buffer(9)]],
+    constant uint32_t& log_size [[buffer(10)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint32_t n_half = 1u << (log_size - 1);
+    if (tid >= n_half) return;
+
+    // Pack input pairs into QM31
+    QM31 val0 = {CM31{in_c0[tid * 2], in_c1[tid * 2]}, CM31{in_c2[tid * 2], in_c3[tid * 2]}};
+    QM31 val1 = {CM31{in_c0[tid * 2 + 1], in_c1[tid * 2 + 1]}, CM31{in_c2[tid * 2 + 1], in_c3[tid * 2 + 1]}};
+
+    // Apply inverse butterfly with M31 twiddle (doubled)
+    uint32_t twiddle_dbl = itwiddles[tid];
+    qm31_ifft_butterfly(val0, val1, twiddle_dbl);
+
+    // Combine: val0 + alpha * val1
+    QM31 result = qm31_add(val0, qm31_mul(alpha, val1));
+
+    // Unpack result to output coords
+    out_c0[tid] = result.c0.a;
+    out_c1[tid] = result.c0.b;
+    out_c2[tid] = result.c1.a;
+    out_c3[tid] = result.c1.b;
+}
+
+/// Fused FRI fold_circle_into_line kernel (coords → coords)
+/// Combines pack + fold + unpack into a single kernel
+///
+/// Parameters:
+/// - src_c0/c1/c2/c3: Source coordinate buffers (M31, length N each)
+/// - dst_c0/c1/c2/c3: Destination coordinate buffers (M31, length N/2 each) - accumulated into
+/// - itwiddles: Inverse twiddles for line domain (layer 1 twiddles, doubled)
+/// - alpha: SecureField folding parameter
+/// - alpha_sq: alpha^2 (precomputed)
+/// - log_size: log2(N)
+kernel void fri_fold_circle_into_line_coords(
+    device const uint32_t* src_c0 [[buffer(0)]],
+    device const uint32_t* src_c1 [[buffer(1)]],
+    device const uint32_t* src_c2 [[buffer(2)]],
+    device const uint32_t* src_c3 [[buffer(3)]],
+    device uint32_t* dst_c0 [[buffer(4)]],
+    device uint32_t* dst_c1 [[buffer(5)]],
+    device uint32_t* dst_c2 [[buffer(6)]],
+    device uint32_t* dst_c3 [[buffer(7)]],
+    device const uint32_t* itwiddles [[buffer(8)]],
+    constant QM31& alpha [[buffer(9)]],
+    constant QM31& alpha_sq [[buffer(10)]],
+    constant uint32_t& log_size [[buffer(11)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint32_t n_half = 1u << (log_size - 1);
+    if (tid >= n_half) return;
+
+    // Pack source pairs into QM31
+    QM31 val0 = {CM31{src_c0[tid * 2], src_c1[tid * 2]}, CM31{src_c2[tid * 2], src_c3[tid * 2]}};
+    QM31 val1 = {CM31{src_c0[tid * 2 + 1], src_c1[tid * 2 + 1]}, CM31{src_c2[tid * 2 + 1], src_c3[tid * 2 + 1]}};
+
+    // Compute layer 0 twiddle from layer 1 twiddles
+    uint32_t k = tid / 4;
+    uint32_t offset = tid % 4;
+    const uint32_t P2 = 0xFFFFFFFE;
+    uint32_t twiddle_dbl;
+
+    if (offset == 0) {
+        twiddle_dbl = itwiddles[2 * k + 1];
+    } else if (offset == 1) {
+        twiddle_dbl = itwiddles[2 * k + 1] ^ P2;
+    } else if (offset == 2) {
+        twiddle_dbl = itwiddles[2 * k] ^ P2;
+    } else {
+        twiddle_dbl = itwiddles[2 * k];
+    }
+
+    // Apply inverse butterfly
+    qm31_ifft_butterfly(val0, val1, twiddle_dbl);
+
+    // Combine: val0 + alpha * val1
+    QM31 folded = qm31_add(val0, qm31_mul(alpha, val1));
+
+    // Pack previous destination value and accumulate
+    QM31 prev = {CM31{dst_c0[tid], dst_c1[tid]}, CM31{dst_c2[tid], dst_c3[tid]}};
+    QM31 scaled = qm31_mul(prev, alpha_sq);
+    QM31 result = qm31_add(scaled, folded);
+
+    // Unpack result to output coords
+    dst_c0[tid] = result.c0.a;
+    dst_c1[tid] = result.c0.b;
+    dst_c2[tid] = result.c1.a;
+    dst_c3[tid] = result.c1.b;
 }
 
 // ============================================================================
@@ -1086,6 +1203,57 @@ kernel void merkle_blake2s(
     // Write output hash (32 bytes = 8 u32s)
     for (int i = 0; i < 8; i++) {
         parents[tid * 8 + i] = state[i];
+    }
+}
+
+/// Merkle tree leaf hashing kernel
+/// Hashes column values: leaf_hash = BLAKE2s(LEAF_PREFIX || column_values)
+/// Supports multi-column hashing where each leaf contains multiple M31 values
+kernel void merkle_blake2s_leaf(
+    device const uint32_t* columns [[buffer(0)]],   // Flattened column data (M31 values)
+    constant uint32_t& num_columns [[buffer(1)]],   // Number of columns
+    constant uint32_t& domain_size [[buffer(2)]],   // Domain size
+    constant bool& is_m31_output [[buffer(3)]],     // Whether to reduce modulo M31
+    device uint32_t* output [[buffer(4)]],          // Output hashes (domain_size * 8 u32s)
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= domain_size) return;
+
+    // Initialize with LEAF_INITIAL_STATE
+    uint32_t state[8];
+    for (int i = 0; i < 8; i++) {
+        state[i] = BLAKE2S_LEAF_INITIAL_STATE[i];
+    }
+
+    // Collect column values for this domain index
+    // Message is: column0[tid], column1[tid], ..., columnN[tid]
+    // Each column value is 4 bytes (uint32_t)
+    uint32_t message[16];
+    uint32_t num_values = num_columns;
+
+    // Load column values into message buffer
+    for (uint32_t col_idx = 0; col_idx < num_columns && col_idx < 16; col_idx++) {
+        message[col_idx] = columns[col_idx * domain_size + tid];
+    }
+
+    // Zero-pad remaining message slots if needed
+    for (uint32_t i = num_columns; i < 16; i++) {
+        message[i] = 0;
+    }
+
+    // Compress the message
+    // Counter is 64 (LEAF_PREFIX) + num_columns * 4 (column bytes)
+    uint32_t counter = 64 + num_columns * 4;
+    blake2s_compress(state, message, counter, 0, true);
+
+    // Optionally reduce output modulo M31
+    if (is_m31_output) {
+        blake2s_reduce_m31(state);
+    }
+
+    // Write output hash
+    for (int i = 0; i < 8; i++) {
+        output[tid * 8 + i] = state[i];
     }
 }
 

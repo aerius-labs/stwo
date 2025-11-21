@@ -83,6 +83,9 @@ pub struct MetalContext {
     /// Merkle BLAKE2s kernel pipeline.
     merkle_pipeline: ComputePipelineState,
 
+    /// Merkle BLAKE2s leaf hashing kernel pipeline.
+    merkle_leaf_pipeline: ComputePipelineState,
+
     /// MLE fold M31→QM31 kernel pipeline (for lookups).
     mle_fold_m31_pipeline: ComputePipelineState,
 
@@ -97,6 +100,12 @@ pub struct MetalContext {
 
     /// Unpack QM31 interleaved format to coordinates kernel pipeline.
     unpack_qm31_to_coords_pipeline: ComputePipelineState,
+
+    /// Fused FRI fold_line kernel (coords → coords).
+    fri_fold_line_coords_pipeline: ComputePipelineState,
+
+    /// Fused FRI fold_circle_into_line kernel (coords → coords).
+    fri_fold_circle_into_line_coords_pipeline: ComputePipelineState,
 
     /// Cache for twiddle factor buffers.
     /// Key is a hash of the twiddle data, value is the Metal buffer.
@@ -156,11 +165,14 @@ impl MetalContext {
         let fri_decompose_pipeline = Self::create_pipeline(&device, &library, "fri_decompose")?;
         let quotient_pipeline = Self::create_pipeline(&device, &library, "quotient_accumulate")?;
         let merkle_pipeline = Self::create_pipeline(&device, &library, "merkle_blake2s")?;
+        let merkle_leaf_pipeline = Self::create_pipeline(&device, &library, "merkle_blake2s_leaf")?;
         let mle_fold_m31_pipeline = Self::create_pipeline(&device, &library, "mle_fold_m31_to_qm31")?;
         let mle_fold_qm31_pipeline = Self::create_pipeline(&device, &library, "mle_fold_qm31_to_qm31")?;
         let grind_pipeline = Self::create_pipeline(&device, &library, "grind_pow")?;
         let pack_coords_to_qm31_pipeline = Self::create_pipeline(&device, &library, "pack_coords_to_qm31")?;
         let unpack_qm31_to_coords_pipeline = Self::create_pipeline(&device, &library, "unpack_qm31_to_coords")?;
+        let fri_fold_line_coords_pipeline = Self::create_pipeline(&device, &library, "fri_fold_line_coords")?;
+        let fri_fold_circle_into_line_coords_pipeline = Self::create_pipeline(&device, &library, "fri_fold_circle_into_line_coords")?;
 
         let buffer_pools = GlobalPools::new(device.clone());
 
@@ -179,11 +191,14 @@ impl MetalContext {
             fri_decompose_pipeline,
             quotient_pipeline,
             merkle_pipeline,
+            merkle_leaf_pipeline,
             mle_fold_m31_pipeline,
             mle_fold_qm31_pipeline,
             grind_pipeline,
             pack_coords_to_qm31_pipeline,
             unpack_qm31_to_coords_pipeline,
+            fri_fold_line_coords_pipeline,
+            fri_fold_circle_into_line_coords_pipeline,
             twiddle_cache: Mutex::new(HashMap::new()),
             flat_twiddle_manager: FlatTwiddleManager::new(),
             buffer_pools,
@@ -286,6 +301,11 @@ impl MetalContext {
         &self.merkle_pipeline
     }
 
+    /// Get Merkle leaf hashing pipeline.
+    pub fn merkle_leaf_pipeline(&self) -> &ComputePipelineState {
+        &self.merkle_leaf_pipeline
+    }
+
     /// Get MLE fold M31→QM31 pipeline.
     pub fn mle_fold_m31_pipeline(&self) -> &ComputePipelineState {
         &self.mle_fold_m31_pipeline
@@ -309,6 +329,16 @@ impl MetalContext {
     /// Get unpack QM31 to coordinates pipeline.
     pub fn unpack_qm31_to_coords_pipeline(&self) -> &ComputePipelineState {
         &self.unpack_qm31_to_coords_pipeline
+    }
+
+    /// Get fused FRI fold_line (coords → coords) pipeline.
+    pub fn fri_fold_line_coords_pipeline(&self) -> &ComputePipelineState {
+        &self.fri_fold_line_coords_pipeline
+    }
+
+    /// Get fused FRI fold_circle_into_line (coords → coords) pipeline.
+    pub fn fri_fold_circle_into_line_coords_pipeline(&self) -> &ComputePipelineState {
+        &self.fri_fold_circle_into_line_coords_pipeline
     }
 
     /// Get or create a flattened twiddle buffer from multiple layers.

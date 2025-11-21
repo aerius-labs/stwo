@@ -17,8 +17,10 @@ use super::thresholds::MIN_MERKLE_LOG_SIZE;
 use super::MetalBackend;
 
 /// Build complete Merkle tree in a single GPU submission.
-/// This is more efficient than layer-by-layer construction but requires
-/// handling the dependencies between layers properly.
+/// This is more efficient than layer-by-layer construction as it:
+/// 1. Pre-allocates all buffers upfront
+/// 2. Submits all layers in a single command buffer
+/// 3. Lets Metal driver schedule layer dependencies automatically
 #[allow(dead_code)]
 fn commit_tree_batched<H: Into<bool>>(
     ctx: &MetalContext,
@@ -289,8 +291,8 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
     ) -> Vec<Blake2sHash> {
         let _timer = crate::metal_profile_fn!("merkle_m31", "CPU/GPU", log_size = log_size, num_columns = columns.len());
 
-        // Fall back to SIMD for small sizes or when columns are present
-        if log_size < MIN_MERKLE_LOG_SIZE || !columns.is_empty() || prev_layer.is_none() {
+        // Fall back to SIMD for small sizes
+        if log_size < MIN_MERKLE_LOG_SIZE {
             use crate::prover::backend::Column;
             use crate::prover::backend::simd::column::BaseColumn;
 
@@ -311,13 +313,79 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
             );
         }
 
-        // Metal GPU path with M31 reduction
-        let prev_layer = prev_layer.unwrap();
-        let num_parents = 1 << log_size;
-        assert_eq!(prev_layer.len(), num_parents * 2);
-
         let ctx = MetalContext::global();
         let device = ctx.device();
+        let domain_size = 1 << log_size;
+
+        // GPU leaf hashing path (when columns are present)
+        if !columns.is_empty() {
+            assert!(prev_layer.is_none(), "Leaf layer should have no prev_layer");
+
+            // Flatten columns using GPU blit
+            let num_columns = columns.len();
+            let columns_buffer_size = (num_columns * domain_size * std::mem::size_of::<u32>()) as u64;
+            let columns_pooled = ctx.checkout_shared_buffer(columns_buffer_size);
+            let columns_buffer = columns_pooled.buffer();
+
+            let command_buffer = ctx.command_queue().new_command_buffer();
+            let blit_encoder = command_buffer.new_blit_command_encoder();
+            let mut offset = 0u64;
+            let col_size = (domain_size * std::mem::size_of::<u32>()) as u64;
+            for col in columns {
+                blit_encoder.copy_from_buffer(col.buffer(), 0, &columns_buffer, offset, col_size);
+                offset += col_size;
+            }
+            blit_encoder.end_encoding();
+
+            // Leaf hash kernel
+            let output_size = (domain_size * 8 * std::mem::size_of::<u32>()) as u64;
+            let output_pooled = ctx.checkout_shared_buffer(output_size);
+            let output_buffer = output_pooled.buffer();
+
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(ctx.merkle_leaf_pipeline());
+            encoder.set_buffer(0, Some(&columns_buffer), 0);
+            let num_columns_u32 = num_columns as u32;
+            encoder.set_bytes(1, std::mem::size_of::<u32>() as u64, &num_columns_u32 as *const u32 as *const _);
+            let domain_size_u32 = domain_size as u32;
+            encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &domain_size_u32 as *const u32 as *const _);
+            let is_m31_output = true;
+            encoder.set_bytes(3, std::mem::size_of::<bool>() as u64, &is_m31_output as *const bool as *const _);
+            encoder.set_buffer(4, Some(&output_buffer), 0);
+
+            let num_threads = domain_size as u64;
+            let threadgroup_size = 256.min(num_threads.max(1));
+            let threadgroups = (num_threads + threadgroup_size - 1) / threadgroup_size;
+            encoder.dispatch_thread_groups(
+                metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+                metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+            );
+
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+
+            let output_data = unsafe { std::slice::from_raw_parts(output_buffer.contents() as *const u32, domain_size * 8) };
+            let mut result = Vec::with_capacity(domain_size);
+            for i in 0..domain_size {
+                let hash_u32s: [u32; 8] = output_data[i * 8..(i + 1) * 8].try_into().unwrap();
+                // Convert u32 array to u8 array (little-endian)
+                let mut hash_u8s = [0u8; 32];
+                for (j, &val) in hash_u32s.iter().enumerate() {
+                    let bytes = val.to_le_bytes();
+                    hash_u8s[j * 4..(j + 1) * 4].copy_from_slice(&bytes);
+                }
+                result.push(Blake2sHash(hash_u8s));
+            }
+            drop(columns_pooled);
+            drop(output_pooled);
+            return result;
+        }
+
+        // Metal GPU path with M31 reduction (node hashing)
+        let prev_layer = prev_layer.unwrap();
+        let num_parents = domain_size;
+        assert_eq!(prev_layer.len(), num_parents * 2);
 
         // Flatten children hashes into u32 array
         let mut children_data = Vec::with_capacity(prev_layer.len() * 8);
