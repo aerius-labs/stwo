@@ -5,6 +5,7 @@
 
 use metal::MTLResourceOptions;
 
+use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::poly::utils::domain_line_twiddles_from_tree;
 use crate::prover::backend::simd::SimdBackend;
@@ -300,24 +301,100 @@ impl FriOps for MetalBackend {
     fn decompose(
         eval: &SecureEvaluation<Self, BitReversedOrder>,
     ) -> (SecureEvaluation<Self, BitReversedOrder>, SecureField) {
-        use crate::prover::backend::Column;
-        use crate::prover::backend::simd::column::BaseColumn;
-        use crate::prover::secure_column::SecureColumnByCoords;
+        let domain_size = eval.len();
+        let half_size = domain_size / 2;
 
-        // Convert Metal eval to SIMD
-        let simd_columns = eval.values.columns.clone().map(|col| {
-            let cpu_vals = col.to_cpu();
-            let simd_col: BaseColumn = cpu_vals.into_iter().collect();
-            simd_col
-        });
-        let simd_values = SecureColumnByCoords { columns: simd_columns };
-        let simd_eval = SecureEvaluation::new(eval.domain, simd_values);
+        // Compute decomposition coefficient lambda on CPU (small reduction, not worth GPU overhead)
+        // lambda = (b_sum - a_sum) / (2 * domain_size)
+        // where a_sum = sum of first half, b_sum = sum of second half
+        let mut a_sum = SecureField::from(BaseField::from(0));
+        let mut b_sum = SecureField::from(BaseField::from(0));
+        for i in 0..half_size {
+            a_sum += eval.values.at(i);
+        }
+        for i in half_size..domain_size {
+            b_sum += eval.values.at(i);
+        }
+        let lambda = (b_sum - a_sum) / SecureField::from(BaseField::from(2 * domain_size as u32));
 
-        let (simd_result, field) = SimdBackend::decompose(&simd_eval);
+        // Apply decompose formula on GPU:
+        // g[i] = eval[i] - lambda  (for i < half_size)
+        // g[i] = eval[i] + lambda  (for i >= half_size)
+        let ctx = MetalContext::global();
+        let device = ctx.device();
 
-        // Convert result back to Metal
-        let metal_values = SecureColumnByCoords::from_simd(simd_result.values);
-        let metal_result = SecureEvaluation::new(simd_result.domain, metal_values);
-        (metal_result, field)
+        // Pack input to QM31
+        let input_qm31_size = (domain_size * 4 * std::mem::size_of::<u32>()) as u64;
+        let input_pooled = ctx.checkout_shared_buffer(input_qm31_size);
+        let input_buffer = input_pooled.buffer();
+
+        // Pack output buffer
+        let output_pooled = ctx.checkout_shared_buffer(input_qm31_size);
+        let output_buffer = output_pooled.buffer();
+
+        // Lambda buffer
+        let lambda_data = lambda.to_m31_array().map(|m| m.0);
+        let lambda_buffer = device.new_buffer_with_data(
+            lambda_data.as_ptr() as *const _,
+            (4 * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Unpack output to coordinate buffers
+        let coord_size = (domain_size * std::mem::size_of::<u32>()) as u64;
+        let out_cols = [
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(coord_size, MTLResourceOptions::StorageModeShared),
+        ];
+
+        let command_buffer = ctx.command_queue().new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        // Pack input coordinates to QM31
+        ctx.pack_coords_to_qm31_batched(
+            &encoder,
+            &eval.values.columns[0],
+            &eval.values.columns[1],
+            &eval.values.columns[2],
+            &eval.values.columns[3],
+            &input_buffer,
+        );
+
+        // FRI decompose kernel: output[i] = input[i] ± lambda
+        encoder.set_compute_pipeline_state(ctx.fri_decompose_pipeline());
+        encoder.set_buffer(0, Some(&input_buffer), 0);
+        encoder.set_buffer(1, Some(&output_buffer), 0);
+        encoder.set_buffer(2, Some(&lambda_buffer), 0);
+        let half_size_u32 = half_size as u32;
+        encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &half_size_u32 as *const u32 as *const _);
+
+        let num_threads = domain_size as u64;
+        let threadgroup_size = 256.min(num_threads.max(1));
+        let threadgroups = (num_threads + threadgroup_size - 1) / threadgroup_size;
+
+        encoder.dispatch_thread_groups(
+            metal::MTLSize { width: threadgroups, height: 1, depth: 1 },
+            metal::MTLSize { width: threadgroup_size, height: 1, depth: 1 },
+        );
+
+        // Unpack QM31 output to coordinates
+        ctx.unpack_qm31_to_coords_batched(&encoder, &output_buffer, &out_cols, domain_size);
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        use crate::prover::backend::metal::column::MetalBaseColumn;
+        let g_values = SecureColumnByCoords {
+            columns: out_cols.map(|buf| MetalBaseColumn::from_buffer(buf, domain_size)),
+        };
+
+        // Keep pooled buffers alive until after GPU completes
+        drop(input_pooled);
+        drop(output_pooled);
+
+        (SecureEvaluation::new(eval.domain, g_values), lambda)
     }
 }

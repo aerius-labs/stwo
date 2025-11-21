@@ -74,6 +74,9 @@ pub struct MetalContext {
     /// FRI fold (line) kernel pipeline.
     fri_fold_line_pipeline: ComputePipelineState,
 
+    /// FRI decompose kernel pipeline.
+    fri_decompose_pipeline: ComputePipelineState,
+
     /// Quotient accumulation kernel pipeline.
     quotient_pipeline: ComputePipelineState,
 
@@ -150,6 +153,7 @@ impl MetalContext {
         let fri_fold_circle_pipeline =
             Self::create_pipeline(&device, &library, "fri_fold_circle_into_line")?;
         let fri_fold_line_pipeline = Self::create_pipeline(&device, &library, "fri_fold_line")?;
+        let fri_decompose_pipeline = Self::create_pipeline(&device, &library, "fri_decompose")?;
         let quotient_pipeline = Self::create_pipeline(&device, &library, "quotient_accumulate")?;
         let merkle_pipeline = Self::create_pipeline(&device, &library, "merkle_blake2s")?;
         let mle_fold_m31_pipeline = Self::create_pipeline(&device, &library, "mle_fold_m31_to_qm31")?;
@@ -172,6 +176,7 @@ impl MetalContext {
             ifft_normalize_pipeline,
             fri_fold_circle_pipeline,
             fri_fold_line_pipeline,
+            fri_decompose_pipeline,
             quotient_pipeline,
             merkle_pipeline,
             mle_fold_m31_pipeline,
@@ -264,6 +269,11 @@ impl MetalContext {
     /// Get FRI fold (line) pipeline.
     pub fn fri_fold_line_pipeline(&self) -> &ComputePipelineState {
         &self.fri_fold_line_pipeline
+    }
+
+    /// Get FRI decompose pipeline.
+    pub fn fri_decompose_pipeline(&self) -> &ComputePipelineState {
+        &self.fri_decompose_pipeline
     }
 
     /// Get quotient accumulation pipeline.

@@ -1223,3 +1223,28 @@ kernel void unpack_qm31_to_coords(
     col2[gid] = in_qm31[in_idx + 2];
     col3[gid] = in_qm31[in_idx + 3];
 }
+
+/// FRI decompose kernel: applies g[i] = eval[i] ± lambda
+/// First half: g[i] = eval[i] - lambda
+/// Second half: g[i] = eval[i] + lambda
+kernel void fri_decompose(
+    device const QM31* input_qm31 [[buffer(0)]],   // Input values (QM31)
+    device QM31* output_qm31 [[buffer(1)]],        // Output values (QM31)
+    constant QM31& lambda [[buffer(2)]],           // Lambda value (QM31)
+    constant uint32_t& half_size [[buffer(3)]],    // Half of domain size
+    uint gid [[thread_position_in_grid]]
+) {
+    // Read input value (QM31)
+    QM31 input_val = input_qm31[gid];
+
+    // Compute output: subtract for first half, add for second half
+    QM31 output_val;
+    if (gid < half_size) {
+        output_val = qm31_sub(input_val, lambda);
+    } else {
+        output_val = qm31_add(input_val, lambda);
+    }
+
+    // Write output (QM31)
+    output_qm31[gid] = output_val;
+}

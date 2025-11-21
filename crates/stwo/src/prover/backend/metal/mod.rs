@@ -66,21 +66,23 @@ use crate::prover::backend::{Backend, BackendForChannel, ColumnOps};
 #[cfg(target_os = "macos")]
 pub mod thresholds {
     /// Minimum log size for GPU FFT.
-    /// Benchmarks show Metal becomes competitive with SIMD at log_size >= 14-16.
-    /// Below this, ~500µs GPU overhead makes SIMD faster.
-    pub const MIN_FFT_LOG_SIZE: u32 = 14;
+    /// Lowered to 12 for batched operations and improved kernels.
+    pub const MIN_FFT_LOG_SIZE: u32 = 12;
 
     /// Minimum log size for GPU FRI folding.
-    pub const MIN_FRI_LOG_SIZE: u32 = 12;
+    /// Lowered to 10 for better GPU utilization in batched contexts.
+    pub const MIN_FRI_LOG_SIZE: u32 = 10;
 
     /// Minimum log size for GPU Merkle operations.
-    pub const MIN_MERKLE_LOG_SIZE: u32 = 10;  // Lowered from 14 to enable GPU for more layers
+    pub const MIN_MERKLE_LOG_SIZE: u32 = 10;
 
     /// Minimum log size for GPU quotient accumulation.
-    pub const MIN_QUOTIENT_LOG_SIZE: u32 = 12;
+    /// Lowered to 10 for better GPU coverage.
+    pub const MIN_QUOTIENT_LOG_SIZE: u32 = 10;
 
     /// Minimum log size for GPU MLE operations.
-    pub const MIN_MLE_LOG_SIZE: u32 = 12;
+    /// Lowered to 10 for better GPU coverage.
+    pub const MIN_MLE_LOG_SIZE: u32 = 10;
 }
 
 // Trait implementations
