@@ -107,6 +107,12 @@ pub struct MetalContext {
     /// Fused FRI fold_circle_into_line kernel (coords → coords).
     fri_fold_circle_into_line_coords_pipeline: ComputePipelineState,
 
+    /// GPU Blake2s channel mix kernel (for GPU-resident Fiat-Shamir state).
+    blake2s_channel_mix_pipeline: ComputePipelineState,
+
+    /// GPU Blake2s channel draw kernel (for GPU-resident Fiat-Shamir state).
+    blake2s_channel_draw_pipeline: ComputePipelineState,
+
     /// Cache for twiddle factor buffers.
     /// Key is a hash of the twiddle data, value is the Metal buffer.
     twiddle_cache: Mutex<HashMap<u64, Buffer>>,
@@ -173,6 +179,8 @@ impl MetalContext {
         let unpack_qm31_to_coords_pipeline = Self::create_pipeline(&device, &library, "unpack_qm31_to_coords")?;
         let fri_fold_line_coords_pipeline = Self::create_pipeline(&device, &library, "fri_fold_line_coords")?;
         let fri_fold_circle_into_line_coords_pipeline = Self::create_pipeline(&device, &library, "fri_fold_circle_into_line_coords")?;
+        let blake2s_channel_mix_pipeline = Self::create_pipeline(&device, &library, "blake2s_channel_mix")?;
+        let blake2s_channel_draw_pipeline = Self::create_pipeline(&device, &library, "blake2s_channel_draw")?;
 
         let buffer_pools = GlobalPools::new(device.clone());
 
@@ -199,6 +207,8 @@ impl MetalContext {
             unpack_qm31_to_coords_pipeline,
             fri_fold_line_coords_pipeline,
             fri_fold_circle_into_line_coords_pipeline,
+            blake2s_channel_mix_pipeline,
+            blake2s_channel_draw_pipeline,
             twiddle_cache: Mutex::new(HashMap::new()),
             flat_twiddle_manager: FlatTwiddleManager::new(),
             buffer_pools,
@@ -339,6 +349,16 @@ impl MetalContext {
     /// Get fused FRI fold_circle_into_line (coords → coords) pipeline.
     pub fn fri_fold_circle_into_line_coords_pipeline(&self) -> &ComputePipelineState {
         &self.fri_fold_circle_into_line_coords_pipeline
+    }
+
+    /// Get Blake2s channel mix pipeline (for GPU-resident Fiat-Shamir state).
+    pub fn blake2s_channel_mix_pipeline(&self) -> &ComputePipelineState {
+        &self.blake2s_channel_mix_pipeline
+    }
+
+    /// Get Blake2s channel draw pipeline (for GPU-resident Fiat-Shamir state).
+    pub fn blake2s_channel_draw_pipeline(&self) -> &ComputePipelineState {
+        &self.blake2s_channel_draw_pipeline
     }
 
     /// Get or create a flattened twiddle buffer from multiple layers.

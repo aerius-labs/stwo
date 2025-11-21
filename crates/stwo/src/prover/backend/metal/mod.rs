@@ -7,6 +7,7 @@
 //! - Merkle tree construction
 //! - Lookup operations (MLE/GKR)
 //! - Proof-of-work grinding
+//! - Blake2s channel operations (GPU-resident state)
 //!
 //! # Memory Model
 //!
@@ -19,12 +20,28 @@
 //! - Threadgroup (shared) memory used for FFT tiles and reductions
 //! - Falls back to SIMD/CPU for small workloads (below threshold)
 //!
-//! # Implementation Status (Phase 0 - Scaffolding)
+//! # GPU-Resident Channel State (Educational - Not Recommended)
 //!
-//! Currently, this backend uses SIMD implementations internally. Metal GPU kernels and
-//! custom column types will be implemented incrementally in later phases. The Metal
-//! infrastructure (context, shaders, custom columns) is ready but not yet integrated
-//! into the main execution path.
+//! The backend provides `MetalBlake2sM31MerkleChannel` which keeps the Fiat-Shamir
+//! channel digest on the GPU, eliminating CPU-GPU round-trips during proof generation.
+//! This is particularly beneficial for FRI operations where the channel is frequently
+//! updated with Merkle roots.
+//!
+//! ## Usage Example
+//! This implementation serves as an educational example of when NOT to use GPU
+//! acceleration. See `channel.rs` module documentation for detailed analysis.
+//!
+//! ```rust,ignore
+//! use stwo::prover::backend::metal::{MetalBackend, MetalBlake2sM31Channel, MetalBlake2sM31MerkleChannel};
+//! use stwo::prover::CommitmentSchemeProver;
+//!
+//! let prover_channel = &mut MetalBlake2sM31Channel::default();
+//! let mut commitment_scheme = CommitmentSchemeProver::<MetalBackend, MetalBlake2sM31MerkleChannel>::new(
+//!     config, &twiddles,
+//! );
+//! ```
+//!
+//! See `crates/examples/examples/test_gpu_channel.rs` for a complete example.
 
 #[cfg(target_os = "macos")]
 mod context;
@@ -37,6 +54,8 @@ mod twiddle_manager;
 #[cfg(target_os = "macos")]
 mod buffer_pool;
 #[cfg(target_os = "macos")]
+mod channel;
+#[cfg(target_os = "macos")]
 pub mod profiling;
 
 // Export Metal context (actively used)
@@ -46,6 +65,13 @@ pub use context::{MetalContext, MetalContextHandle};
 // Export Metal column types (now actively used)
 #[cfg(target_os = "macos")]
 pub use column::{GpuSlice, MetalBaseColumn, MetalSecureColumn};
+
+// Export GPU channel types (for GPU-resident Fiat-Shamir state)
+#[cfg(target_os = "macos")]
+pub use channel::{
+    MetalBlake2sChannel, MetalBlake2sM31Channel,
+    MetalBlake2sMerkleChannel, MetalBlake2sM31MerkleChannel,
+};
 
 #[cfg(target_os = "macos")]
 use serde::{Deserialize, Serialize};
@@ -117,6 +143,12 @@ impl BackendForChannel<Blake2sMerkleChannel> for MetalBackend {}
 
 #[cfg(target_os = "macos")]
 impl BackendForChannel<Blake2sM31MerkleChannel> for MetalBackend {}
+
+#[cfg(target_os = "macos")]
+impl BackendForChannel<MetalBlake2sMerkleChannel> for MetalBackend {}
+
+#[cfg(target_os = "macos")]
+impl BackendForChannel<MetalBlake2sM31MerkleChannel> for MetalBackend {}
 
 // ============================================================================
 // PHASE 1 ARCHITECTURE DECISION: MetalBackend = "SIMD + GPU Helpers"

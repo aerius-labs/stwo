@@ -384,6 +384,103 @@ inline void blake2s_reduce_m31(thread uint32_t hash[8]) {
     }
 }
 
+// ============================================================================
+// GPU Channel State Kernels
+// ============================================================================
+
+/// GPU Blake2s channel mix kernel
+/// Computes: new_digest = BLAKE2s(old_digest || data)
+/// This is used to mix Merkle roots into the Fiat-Shamir channel state
+///
+/// Single-thread execution: Channel operations are inherently serial
+kernel void blake2s_channel_mix(
+    device const uint32_t* old_digest [[buffer(0)]],  // 8 u32s (32 bytes)
+    device const uint32_t* data [[buffer(1)]],         // 8 u32s (32 bytes) - root hash
+    constant bool& is_m31_output [[buffer(2)]],
+    device uint32_t* new_digest [[buffer(3)]],         // Output: 8 u32s
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;  // Single thread only
+
+    // Prepare 64-byte message: old_digest || data
+    uint32_t message[16];
+    for (int i = 0; i < 8; i++) {
+        message[i] = old_digest[i];
+        message[8 + i] = data[i];
+    }
+
+    // Initialize BLAKE2s state
+    uint32_t state[8];
+    blake2s_init(state);
+
+    // Compress the 64-byte message (final block)
+    blake2s_compress(state, message, 64, 0, true);
+
+    // Reduce to M31 if required
+    if (is_m31_output) {
+        blake2s_reduce_m31(state);
+    }
+
+    // Write output
+    for (int i = 0; i < 8; i++) {
+        new_digest[i] = state[i];
+    }
+}
+
+/// GPU Blake2s channel draw kernel
+/// Computes: output = BLAKE2s(digest || counter || domain_separator)
+/// This is used to draw random field elements from the channel
+///
+/// Single-thread execution: Channel operations are inherently serial
+kernel void blake2s_channel_draw(
+    device const uint32_t* digest [[buffer(0)]],       // 8 u32s (32 bytes)
+    constant uint32_t& counter [[buffer(1)]],          // Draw counter
+    constant uint8_t& domain_sep [[buffer(2)]],        // Domain separator (typically 0)
+    constant bool& is_m31_output [[buffer(3)]],
+    device uint32_t* output [[buffer(4)]],             // Output: 8 u32s
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;  // Single thread only
+
+    // Prepare 37-byte message: digest || counter || domain_sep
+    // BLAKE2s processes in 64-byte blocks, so we need to pad
+    uint32_t message[16];  // 64 bytes total
+
+    // Copy digest (32 bytes = 8 u32s)
+    for (int i = 0; i < 8; i++) {
+        message[i] = digest[i];
+    }
+
+    // Add counter as little-endian u32 (4 bytes)
+    message[8] = counter;
+
+    // Add domain separator (1 byte) + padding
+    // Pack domain_sep into message[9] as first byte
+    message[9] = (uint32_t)domain_sep;
+
+    // Zero remaining bytes (28 bytes padding)
+    for (int i = 10; i < 16; i++) {
+        message[i] = 0;
+    }
+
+    // Initialize BLAKE2s state
+    uint32_t state[8];
+    blake2s_init(state);
+
+    // Compress the 37-byte message (final block, length = 37)
+    blake2s_compress(state, message, 37, 0, true);
+
+    // Reduce to M31 if required
+    if (is_m31_output) {
+        blake2s_reduce_m31(state);
+    }
+
+    // Write output
+    for (int i = 0; i < 8; i++) {
+        output[i] = state[i];
+    }
+}
+
 /// IFFT normalization kernel: multiply all elements by 1/N.
 ///
 /// After inverse FFT, we need to normalize by dividing by domain size.
