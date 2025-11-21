@@ -32,7 +32,7 @@ use stwo_constraint_framework::TraceLocationAllocator;
 use stwo_examples::wide_fibonacci::{generate_trace, FibInput, WideFibonacciComponent, WideFibonacciEval};
 
 #[cfg(all(target_os = "macos", feature = "metal_prover"))]
-use stwo::prover::backend::metal::MetalBackend;
+use stwo::prover::backend::metal::{MetalBackend, MetalBlake2sM31Channel, MetalBlake2sM31MerkleChannel};
 
 const FIB_SEQUENCE_LENGTH: usize = 100;
 
@@ -77,7 +77,7 @@ fn bench_simd_e2e_proof(c: &mut Criterion) {
     // Test realistic problem sizes
     // log_n_instances controls the number of Fibonacci instances, not trace size
     // The actual trace has ~100 columns
-    for log_n_instances in [6, 8, 10, 12, 14] {
+    for log_n_instances in [6, 8, 10, 12, 14, 15, 16, 17, 18] {
         let description = format!("log_n={} (~{}K trace)", log_n_instances, (1 << log_n_instances) / 1024);
 
         group.bench_function(BenchmarkId::new("simd", &description), |b| {
@@ -143,10 +143,13 @@ fn bench_simd_e2e_proof(c: &mut Criterion) {
 
 #[cfg(all(target_os = "macos", feature = "metal_prover"))]
 fn bench_metal_e2e_proof(c: &mut Criterion) {
-    let mut group = c.benchmark_group("e2e_proof_metal");
-    group.sample_size(10);
+    // Initialize profiling if METAL_PROFILE env var is set
+    stwo::prover::backend::metal::profiling::init_profiling();
 
-    for log_n_instances in [6, 8, 10, 12, 14] {
+    let mut group = c.benchmark_group("e2e_proof_metal");
+    group.sample_size(20);
+
+    for log_n_instances in [6, 8, 10, 12, 14, 15, 16, 17, 18] {
         let description = format!("log_n={} (~{}K trace)", log_n_instances, (1 << log_n_instances) / 1024);
 
         group.bench_function(BenchmarkId::new("metal", &description), |b| {
@@ -165,10 +168,10 @@ fn bench_metal_e2e_proof(c: &mut Criterion) {
                             .half_coset,
                     );
 
-                    // Setup protocol
-                    let prover_channel = &mut Blake2sM31Channel::default();
+                    // Setup protocol with GPU-resident channel state
+                    let prover_channel = &mut MetalBlake2sM31Channel::default();
                     let mut commitment_scheme =
-                        CommitmentSchemeProver::<MetalBackend, Blake2sM31MerkleChannel>::new(
+                        CommitmentSchemeProver::<MetalBackend, MetalBlake2sM31MerkleChannel>::new(
                             config, &twiddles,
                         );
 
@@ -199,7 +202,7 @@ fn bench_metal_e2e_proof(c: &mut Criterion) {
                         SecureField::zero(),
                     );
 
-                    let _proof = prove::<MetalBackend, Blake2sM31MerkleChannel>(
+                    let _proof = prove::<MetalBackend, MetalBlake2sM31MerkleChannel>(
                         &[&component],
                         prover_channel,
                         commitment_scheme,
