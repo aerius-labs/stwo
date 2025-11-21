@@ -71,38 +71,12 @@ impl QuotientOps for MetalBackend {
         let device = ctx.device();
         let command_queue = ctx.command_queue();
 
-        // Flatten column data using GPU blit encoder (avoids GPU→CPU→GPU round-trip)
-        let _flatten_timer = std::time::Instant::now();
+        // Prepare column buffer for flattening
         let columns_buffer_size = (num_columns * domain_size * std::mem::size_of::<u32>()) as u64;
         let columns_pooled = ctx.checkout_shared_buffer(columns_buffer_size);
         let columns_buffer = columns_pooled.buffer();
 
-        // Use blit encoder to copy column buffers on GPU
-        let flatten_cmd = command_queue.new_command_buffer();
-        let blit_encoder = flatten_cmd.new_blit_command_encoder();
-
-        let mut offset = 0u64;
-        let col_size = (domain_size * std::mem::size_of::<u32>()) as u64;
-        for col in columns {
-            blit_encoder.copy_from_buffer(
-                col.values.buffer(),
-                0,
-                &columns_buffer,
-                offset,
-                col_size,
-            );
-            offset += col_size;
-        }
-
-        blit_encoder.end_encoding();
-        flatten_cmd.commit();
-        flatten_cmd.wait_until_completed();
-
-        if std::env::var("METAL_PROFILE").is_ok() {
-            eprintln!("[GPU_PROFILE] quotient_flatten_blit | num_columns={}, domain_size={} | time={:.3}ms", num_columns, domain_size, _flatten_timer.elapsed().as_secs_f64() * 1000.0);
-        }
-
-        // Flatten line coefficients and build metadata
+        // Flatten line coefficients and build metadata (CPU work, independent of GPU blit)
         let mut line_coeffs_flat = Vec::new();
         let mut column_indices = Vec::new();
         let mut batch_sizes = Vec::new();
@@ -193,8 +167,26 @@ impl QuotientOps for MetalBackend {
         let output_pooled = ctx.checkout_shared_buffer(output_size);
         let output_buffer = output_pooled.buffer();
 
-        // Dispatch kernel
+        // Fuse blit + quotient kernel into single command buffer (eliminates one synchronization point)
         let command_buffer = command_queue.new_command_buffer();
+
+        // Step 1: Blit encoder to flatten columns on GPU
+        let blit_encoder = command_buffer.new_blit_command_encoder();
+        let mut offset = 0u64;
+        let col_size = (domain_size * std::mem::size_of::<u32>()) as u64;
+        for col in columns {
+            blit_encoder.copy_from_buffer(
+                col.values.buffer(),
+                0,
+                &columns_buffer,
+                offset,
+                col_size,
+            );
+            offset += col_size;
+        }
+        blit_encoder.end_encoding();
+
+        // Step 2: Quotient kernel (automatically waits for blit to complete via Metal dependencies)
         let encoder = command_buffer.new_compute_command_encoder();
 
         let pipeline = ctx.quotient_pipeline();

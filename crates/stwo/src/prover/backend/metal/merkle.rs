@@ -3,18 +3,181 @@
 //! This module implements Merkle tree construction with GPU acceleration for large workloads
 //! and SIMD fallback for small workloads.
 
-use metal::MTLResourceOptions;
+use metal::{Buffer, MTLResourceOptions};
+use std::sync::{Arc, Mutex};
 
 use crate::core::fields::m31::BaseField;
 use crate::core::vcs::blake2_hash::Blake2sHash;
 use crate::core::vcs::blake2_merkle::{Blake2sM31MerkleHasher, Blake2sMerkleHasher};
 use crate::prover::backend::simd::SimdBackend;
-use crate::prover::backend::{Col, ColumnOps};
+use crate::prover::backend::{Col, Column, ColumnOps};
 use crate::prover::vcs::ops::MerkleOps;
 
 use super::context::MetalContext;
 use super::thresholds::MIN_MERKLE_LOG_SIZE;
 use super::MetalBackend;
+
+/// Lazy GPU-backed column for Blake2s hashes.
+/// Defers synchronization until data is actually accessed.
+#[derive(Clone)]
+pub struct MetalBlake2sColumn {
+    buffer: Buffer,
+    len: usize,
+    /// Shared state for lazy synchronization
+    sync_state: Arc<Mutex<SyncState>>,
+}
+
+#[derive(Clone)]
+enum SyncState {
+    /// GPU work pending, need to wait before reading
+    Pending(Arc<metal::CommandBuffer>),
+    /// GPU work completed, data ready
+    Synced,
+}
+
+impl MetalBlake2sColumn {
+    /// Create column from GPU buffer with pending command buffer
+    fn from_gpu_pending(buffer: Buffer, len: usize, cmd_buf: Arc<metal::CommandBuffer>) -> Self {
+        Self {
+            buffer,
+            len,
+            sync_state: Arc::new(Mutex::new(SyncState::Pending(cmd_buf))),
+        }
+    }
+
+    /// Create column from CPU data (already synced)
+    fn from_cpu(hashes: Vec<Blake2sHash>) -> Self {
+        let ctx = MetalContext::global();
+        let len = hashes.len();
+
+        // Flatten to u32 array
+        let mut data = Vec::with_capacity(len * 8);
+        for hash in &hashes {
+            let hash_u32s: &[u32; 8] = bytemuck::cast_ref(&hash.0);
+            data.extend_from_slice(hash_u32s);
+        }
+
+        let buffer = ctx.device().new_buffer_with_data(
+            data.as_ptr() as *const _,
+            (data.len() * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        Self {
+            buffer,
+            len,
+            sync_state: Arc::new(Mutex::new(SyncState::Synced)),
+        }
+    }
+
+    /// Ensure GPU work is complete before reading
+    fn ensure_synced(&self) {
+        let mut state = self.sync_state.lock().unwrap();
+        if let SyncState::Pending(cmd_buf) = &*state {
+            cmd_buf.wait_until_completed();
+            *state = SyncState::Synced;
+        }
+    }
+
+    /// Read a single hash at index
+    fn read_hash(&self, index: usize) -> Blake2sHash {
+        self.ensure_synced();
+
+        let output_data = unsafe {
+            std::slice::from_raw_parts(
+                self.buffer.contents() as *const u32,
+                self.len * 8,
+            )
+        };
+
+        let hash_u32s: [u32; 8] = [
+            output_data[index * 8],
+            output_data[index * 8 + 1],
+            output_data[index * 8 + 2],
+            output_data[index * 8 + 3],
+            output_data[index * 8 + 4],
+            output_data[index * 8 + 5],
+            output_data[index * 8 + 6],
+            output_data[index * 8 + 7],
+        ];
+        let hash_bytes: [u8; 32] = bytemuck::cast(hash_u32s);
+        Blake2sHash(hash_bytes)
+    }
+
+    /// Get buffer for GPU operations (no sync required)
+    pub fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+}
+
+impl std::fmt::Debug for MetalBlake2sColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalBlake2sColumn")
+            .field("len", &self.len)
+            .field("synced", &matches!(*self.sync_state.lock().unwrap(), SyncState::Synced))
+            .finish()
+    }
+}
+
+impl Column<Blake2sHash> for MetalBlake2sColumn {
+    fn zeros(_len: usize) -> Self {
+        unimplemented!("Blake2s columns are not zero-initialized")
+    }
+
+    unsafe fn uninitialized(_len: usize) -> Self {
+        unimplemented!("Blake2s columns are created from GPU kernels")
+    }
+
+    fn to_cpu(&self) -> Vec<Blake2sHash> {
+        self.ensure_synced();
+
+        let output_data = unsafe {
+            std::slice::from_raw_parts(
+                self.buffer.contents() as *const u32,
+                self.len * 8,
+            )
+        };
+
+        let mut result = Vec::with_capacity(self.len);
+        for i in 0..self.len {
+            let hash_u32s: [u32; 8] = [
+                output_data[i * 8],
+                output_data[i * 8 + 1],
+                output_data[i * 8 + 2],
+                output_data[i * 8 + 3],
+                output_data[i * 8 + 4],
+                output_data[i * 8 + 5],
+                output_data[i * 8 + 6],
+                output_data[i * 8 + 7],
+            ];
+            let hash_bytes: [u8; 32] = bytemuck::cast(hash_u32s);
+            result.push(Blake2sHash(hash_bytes));
+        }
+        result
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn at(&self, index: usize) -> Blake2sHash {
+        self.read_hash(index)
+    }
+
+    fn set(&mut self, _index: usize, _value: Blake2sHash) {
+        unimplemented!("Blake2s columns are read-only")
+    }
+
+    fn split_at_mid(self) -> (Self, Self) {
+        unimplemented!("Blake2s columns don't support splitting")
+    }
+}
+
+impl FromIterator<Blake2sHash> for MetalBlake2sColumn {
+    fn from_iter<T: IntoIterator<Item = Blake2sHash>>(iter: T) -> Self {
+        Self::from_cpu(iter.into_iter().collect())
+    }
+}
 
 /// Build complete Merkle tree in a single GPU submission.
 /// This is more efficient than layer-by-layer construction as it:
@@ -142,9 +305,9 @@ fn commit_tree_batched<H: Into<bool>>(
     results
 }
 
-// Blake2s hash columns are just Vec<Blake2sHash> like in SIMD backend
+// Blake2s hash columns use lazy GPU-backed columns
 impl ColumnOps<Blake2sHash> for MetalBackend {
-    type Column = Vec<Blake2sHash>;
+    type Column = MetalBlake2sColumn;
 
     fn bit_reverse_column(_column: &mut Self::Column) {
         unimplemented!()
@@ -154,9 +317,9 @@ impl ColumnOps<Blake2sHash> for MetalBackend {
 impl MerkleOps<Blake2sMerkleHasher> for MetalBackend {
     fn commit_on_layer(
         log_size: u32,
-        prev_layer: Option<&Vec<Blake2sHash>>,
+        prev_layer: Option<&MetalBlake2sColumn>,
         columns: &[&Col<Self, BaseField>],
-    ) -> Vec<Blake2sHash> {
+    ) -> MetalBlake2sColumn {
         let _timer = crate::metal_profile_fn!("merkle_blake2s", "CPU/GPU", log_size = log_size, num_columns = columns.len());
 
         // Fall back to SIMD for small sizes or when columns are present
@@ -175,40 +338,29 @@ impl MerkleOps<Blake2sMerkleHasher> for MetalBackend {
                 .collect();
             let simd_columns_refs: Vec<&BaseColumn> = simd_columns_owned.iter().collect();
 
-            return <SimdBackend as MerkleOps<Blake2sMerkleHasher>>::commit_on_layer(
+            let prev_layer_cpu = prev_layer.map(|l| l.to_cpu());
+            let simd_result = <SimdBackend as MerkleOps<Blake2sMerkleHasher>>::commit_on_layer(
                 log_size,
-                prev_layer,
+                prev_layer_cpu.as_ref(),
                 &simd_columns_refs,
             );
+
+            return MetalBlake2sColumn::from_cpu(simd_result);
         }
 
-        // Metal GPU path - hash pairs of child nodes
+        // Metal GPU path - hash pairs of child nodes (LAZY SYNC)
         let prev_layer = prev_layer.unwrap();
         let num_parents = 1 << log_size;
-        assert_eq!(prev_layer.len(), num_parents * 2);
 
         let ctx = MetalContext::global();
         let device = ctx.device();
 
-        // Flatten children hashes into u32 array
-        // Each Blake2sHash is 32 bytes = 8 u32s
-        let mut children_data = Vec::with_capacity(prev_layer.len() * 8);
-        for hash in prev_layer {
-            let hash_u32s: &[u32; 8] = bytemuck::cast_ref(&hash.0);
-            children_data.extend_from_slice(hash_u32s);
-        }
-
-        // Create buffers
-        let children_buffer = device.new_buffer_with_data(
-            children_data.as_ptr() as *const _,
-            (children_data.len() * std::mem::size_of::<u32>()) as u64,
+        // Allocate output buffer (GPU will write all values)
+        let parents_size = (num_parents * 8 * std::mem::size_of::<u32>()) as u64;
+        let parents_buffer = device.new_buffer(
+            parents_size,
             MTLResourceOptions::StorageModeShared,
         );
-
-        // Allocate output buffer using buffer pool (GPU will write all values)
-        let parents_size = (num_parents * 8 * std::mem::size_of::<u32>()) as u64;
-        let parents_pooled = ctx.checkout_shared_buffer(parents_size);
-        let parents_buffer = parents_pooled.buffer();
 
         let is_m31_output: bool = false;
         let size_param = num_parents as u32;
@@ -217,7 +369,7 @@ impl MerkleOps<Blake2sMerkleHasher> for MetalBackend {
         let command_buffer = ctx.command_queue().new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(ctx.merkle_pipeline());
-        encoder.set_buffer(0, Some(&children_buffer), 0);
+        encoder.set_buffer(0, Some(prev_layer.buffer()), 0);
         encoder.set_buffer(1, Some(&parents_buffer), 0);
         encoder.set_bytes(
             2,
@@ -249,46 +401,22 @@ impl MerkleOps<Blake2sMerkleHasher> for MetalBackend {
 
         encoder.end_encoding();
         command_buffer.commit();
-        command_buffer.wait_until_completed();
 
-        // Read back results
-        let output_data = unsafe {
-            std::slice::from_raw_parts(
-                parents_buffer.contents() as *const u32,
-                num_parents * 8,
-            )
-        };
-
-        // Convert u32 array back to Blake2sHash
-        let mut result = Vec::with_capacity(num_parents);
-        for i in 0..num_parents {
-            let hash_u32s: [u32; 8] = [
-                output_data[i * 8],
-                output_data[i * 8 + 1],
-                output_data[i * 8 + 2],
-                output_data[i * 8 + 3],
-                output_data[i * 8 + 4],
-                output_data[i * 8 + 5],
-                output_data[i * 8 + 6],
-                output_data[i * 8 + 7],
-            ];
-            let hash_bytes: [u8; 32] = bytemuck::cast(hash_u32s);
-            result.push(Blake2sHash(hash_bytes));
-        }
-
-        // Keep pooled buffer alive until after GPU completes and data is read
-        drop(parents_pooled);
-
-        result
+        // NO WAIT - Return lazy column with pending command buffer
+        MetalBlake2sColumn::from_gpu_pending(
+            parents_buffer,
+            num_parents,
+            Arc::new(command_buffer.to_owned()),
+        )
     }
 }
 
 impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
     fn commit_on_layer(
         log_size: u32,
-        prev_layer: Option<&Vec<Blake2sHash>>,
+        prev_layer: Option<&MetalBlake2sColumn>,
         columns: &[&Col<Self, BaseField>],
-    ) -> Vec<Blake2sHash> {
+    ) -> MetalBlake2sColumn {
         let _timer = crate::metal_profile_fn!("merkle_m31", "CPU/GPU", log_size = log_size, num_columns = columns.len());
 
         // Fall back to SIMD for small sizes
@@ -306,28 +434,42 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
                 .collect();
             let simd_columns_refs: Vec<&BaseColumn> = simd_columns_owned.iter().collect();
 
-            return <SimdBackend as MerkleOps<Blake2sM31MerkleHasher>>::commit_on_layer(
+            let prev_layer_cpu = prev_layer.map(|l| l.to_cpu());
+            let simd_result = <SimdBackend as MerkleOps<Blake2sM31MerkleHasher>>::commit_on_layer(
                 log_size,
-                prev_layer,
+                prev_layer_cpu.as_ref(),
                 &simd_columns_refs,
             );
+
+            return MetalBlake2sColumn::from_cpu(simd_result);
         }
 
         let ctx = MetalContext::global();
         let device = ctx.device();
         let domain_size = 1 << log_size;
 
-        // GPU leaf hashing path (when columns are present)
+        // GPU leaf hashing path (when columns are present) - LAZY SYNC
         if !columns.is_empty() {
             assert!(prev_layer.is_none(), "Leaf layer should have no prev_layer");
 
-            // Flatten columns using GPU blit
             let num_columns = columns.len();
+
+            // Allocate persistent buffers (not pooled, owned by column)
             let columns_buffer_size = (num_columns * domain_size * std::mem::size_of::<u32>()) as u64;
-            let columns_pooled = ctx.checkout_shared_buffer(columns_buffer_size);
-            let columns_buffer = columns_pooled.buffer();
+            let columns_buffer = device.new_buffer(
+                columns_buffer_size,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let output_size = (domain_size * 8 * std::mem::size_of::<u32>()) as u64;
+            let output_buffer = device.new_buffer(
+                output_size,
+                MTLResourceOptions::StorageModeShared,
+            );
 
             let command_buffer = ctx.command_queue().new_command_buffer();
+
+            // Flatten columns using GPU blit
             let blit_encoder = command_buffer.new_blit_command_encoder();
             let mut offset = 0u64;
             let col_size = (domain_size * std::mem::size_of::<u32>()) as u64;
@@ -338,10 +480,6 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
             blit_encoder.end_encoding();
 
             // Leaf hash kernel
-            let output_size = (domain_size * 8 * std::mem::size_of::<u32>()) as u64;
-            let output_pooled = ctx.checkout_shared_buffer(output_size);
-            let output_buffer = output_pooled.buffer();
-
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(ctx.merkle_leaf_pipeline());
             encoder.set_buffer(0, Some(&columns_buffer), 0);
@@ -363,48 +501,25 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
 
             encoder.end_encoding();
             command_buffer.commit();
-            command_buffer.wait_until_completed();
 
-            let output_data = unsafe { std::slice::from_raw_parts(output_buffer.contents() as *const u32, domain_size * 8) };
-            let mut result = Vec::with_capacity(domain_size);
-            for i in 0..domain_size {
-                let hash_u32s: [u32; 8] = output_data[i * 8..(i + 1) * 8].try_into().unwrap();
-                // Convert u32 array to u8 array (little-endian)
-                let mut hash_u8s = [0u8; 32];
-                for (j, &val) in hash_u32s.iter().enumerate() {
-                    let bytes = val.to_le_bytes();
-                    hash_u8s[j * 4..(j + 1) * 4].copy_from_slice(&bytes);
-                }
-                result.push(Blake2sHash(hash_u8s));
-            }
-            drop(columns_pooled);
-            drop(output_pooled);
-            return result;
+            // NO WAIT - Return lazy column with pending command buffer
+            return MetalBlake2sColumn::from_gpu_pending(
+                output_buffer,
+                domain_size,
+                Arc::new(command_buffer.to_owned()),
+            );
         }
 
-        // Metal GPU path with M31 reduction (node hashing)
+        // Metal GPU path with M31 reduction (node hashing) - LAZY SYNC
         let prev_layer = prev_layer.unwrap();
         let num_parents = domain_size;
-        assert_eq!(prev_layer.len(), num_parents * 2);
 
-        // Flatten children hashes into u32 array
-        let mut children_data = Vec::with_capacity(prev_layer.len() * 8);
-        for hash in prev_layer {
-            let hash_u32s: &[u32; 8] = bytemuck::cast_ref(&hash.0);
-            children_data.extend_from_slice(hash_u32s);
-        }
-
-        // Create buffers
-        let children_buffer = device.new_buffer_with_data(
-            children_data.as_ptr() as *const _,
-            (children_data.len() * std::mem::size_of::<u32>()) as u64,
+        // Allocate output buffer (not pooled, owned by column)
+        let parents_size = (num_parents * 8 * std::mem::size_of::<u32>()) as u64;
+        let parents_buffer = device.new_buffer(
+            parents_size,
             MTLResourceOptions::StorageModeShared,
         );
-
-        // Allocate output buffer using buffer pool (GPU will write all values)
-        let parents_size = (num_parents * 8 * std::mem::size_of::<u32>()) as u64;
-        let parents_pooled = ctx.checkout_shared_buffer(parents_size);
-        let parents_buffer = parents_pooled.buffer();
 
         let is_m31_output: bool = true; // M31 reduction enabled
         let size_param = num_parents as u32;
@@ -413,7 +528,7 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
         let command_buffer = ctx.command_queue().new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(ctx.merkle_pipeline());
-        encoder.set_buffer(0, Some(&children_buffer), 0);
+        encoder.set_buffer(0, Some(prev_layer.buffer()), 0);
         encoder.set_buffer(1, Some(&parents_buffer), 0);
         encoder.set_bytes(
             2,
@@ -445,36 +560,45 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
 
         encoder.end_encoding();
         command_buffer.commit();
-        command_buffer.wait_until_completed();
 
-        // Read back results
-        let output_data = unsafe {
-            std::slice::from_raw_parts(
-                parents_buffer.contents() as *const u32,
-                num_parents * 8,
-            )
-        };
+        // NO WAIT - Return lazy column with pending command buffer
+        MetalBlake2sColumn::from_gpu_pending(
+            parents_buffer,
+            num_parents,
+            Arc::new(command_buffer.to_owned()),
+        )
+    }
 
-        // Convert u32 array back to Blake2sHash (already M31-reduced by GPU)
-        let mut result = Vec::with_capacity(num_parents);
-        for i in 0..num_parents {
-            let hash_u32s: [u32; 8] = [
-                output_data[i * 8],
-                output_data[i * 8 + 1],
-                output_data[i * 8 + 2],
-                output_data[i * 8 + 3],
-                output_data[i * 8 + 4],
-                output_data[i * 8 + 5],
-                output_data[i * 8 + 6],
-                output_data[i * 8 + 7],
-            ];
-            let hash_bytes: [u8; 32] = bytemuck::cast(hash_u32s);
-            result.push(Blake2sHash(hash_bytes));
+    /// Batched commit for multiple consecutive node-only layers.
+    /// With lazy sync, layer-by-layer is efficient since GPU work is queued without waits.
+    fn commit_node_layers_batched(
+        initial_layer: &Col<Self, Blake2sHash>,
+        num_layers: u32,
+    ) -> Vec<Col<Self, Blake2sHash>> {
+        let _timer = crate::metal_profile_fn!("merkle_m31_batched", "GPU", num_layers = num_layers, initial_size = initial_layer.len());
+
+        // Use layer-by-layer with lazy sync (GPU work queued without synchronization)
+        Self::commit_node_layers_batched_default(initial_layer, num_layers)
+    }
+}
+
+// Default implementation helper (extracted to avoid code duplication)
+impl MetalBackend {
+    fn commit_node_layers_batched_default(
+        initial_layer: &MetalBlake2sColumn,
+        num_layers: u32,
+    ) -> Vec<MetalBlake2sColumn> {
+        let mut layers = Vec::new();
+        let mut prev_layer = initial_layer;
+        let mut log_size = initial_layer.len().ilog2() - 1;
+
+        for _ in 0..num_layers {
+            let layer = <Self as MerkleOps<Blake2sM31MerkleHasher>>::commit_on_layer(log_size, Some(prev_layer), &[]);
+            layers.push(layer);
+            prev_layer = layers.last().unwrap();
+            log_size = log_size.saturating_sub(1);
         }
 
-        // Keep pooled buffer alive until after GPU completes and data is read
-        drop(parents_pooled);
-
-        result
+        layers
     }
 }

@@ -52,14 +52,68 @@ impl<B: MerkleOps<H>, H: MerkleHasher> MerkleProver<B, H> {
         let mut layers: Vec<Col<B, H::Hash>> = Vec::new();
 
         let max_log_size = columns.peek().unwrap().len().ilog2();
-        for log_size in (0..=max_log_size).rev() {
-            // Take columns of the current log_size.
-            let layer_columns = columns
-                .peek_take_while(|column| column.len().ilog2() == log_size)
-                .collect_vec();
 
-            layers.push(B::commit_on_layer(log_size, layers.last(), &layer_columns));
+        #[cfg(feature = "metal_prover")]
+        {
+            // Metal-specific optimization: batch consecutive node-only layers
+            let mut log_size = max_log_size;
+            while log_size > 0 || columns.peek().is_some() {
+                // Take columns of the current log_size
+                let layer_columns = columns
+                    .peek_take_while(|column| column.len().ilog2() == log_size)
+                    .collect_vec();
+
+                if !layer_columns.is_empty() {
+                    // Layer has columns - process normally
+                    layers.push(B::commit_on_layer(log_size, layers.last(), &layer_columns));
+                    if log_size == 0 {
+                        break;
+                    }
+                    log_size -= 1;
+                } else if layers.is_empty() {
+                    // No previous layer yet, can't batch
+                    break;
+                } else {
+                    // No columns for this layer - look ahead to batch consecutive node-only layers
+                    let mut num_node_layers = 0;
+                    let mut scan_log_size = log_size;
+
+                    // Count consecutive node-only layers
+                    while scan_log_size > 0 && columns.peek().map_or(true, |c| c.len().ilog2() < scan_log_size) {
+                        num_node_layers += 1;
+                        scan_log_size -= 1;
+                    }
+
+                    // Batch if we have multiple node-only layers (threshold: 2+)
+                    if num_node_layers >= 2 {
+                        let batched = B::commit_node_layers_batched(layers.last().unwrap(), num_node_layers);
+                        layers.extend(batched);
+                        log_size = scan_log_size;
+                    } else {
+                        // Single layer, process normally
+                        layers.push(B::commit_on_layer(log_size, layers.last(), &[]));
+                        if log_size == 0 {
+                            break;
+                        }
+                        log_size -= 1;
+                    }
+                }
+            }
         }
+
+        #[cfg(not(feature = "metal_prover"))]
+        {
+            // Standard path for non-Metal backends
+            for log_size in (0..=max_log_size).rev() {
+                // Take columns of the current log_size.
+                let layer_columns = columns
+                    .peek_take_while(|column| column.len().ilog2() == log_size)
+                    .collect_vec();
+
+                layers.push(B::commit_on_layer(log_size, layers.last(), &layer_columns));
+            }
+        }
+
         layers.reverse();
         Self { layers }
     }
