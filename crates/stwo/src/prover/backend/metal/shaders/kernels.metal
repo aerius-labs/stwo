@@ -889,12 +889,52 @@ kernel void circle_ifft_radix2(
 // Quotient Accumulation Kernels
 // ============================================================================
 
-/// Quotient accumulation kernel.
+/// Montgomery batch inversion for CM31 (device function).
+/// Inverts an array of CM31 elements in-place using Montgomery's trick.
+/// Reduces num_batches individual inversions to 1 + constant overhead.
+///
+/// Algorithm:
+/// 1. Forward pass: Compute cumulative products
+/// 2. Invert the final product (single CM31 inversion)
+/// 3. Backward pass: Compute individual inverses
+///
+/// This is GPU-native - no CPU round-trip required.
+void cm31_batch_inverse_inplace(thread CM31* values, uint count) {
+    if (count == 0) return;
+    if (count == 1) {
+        values[0] = cm31_inverse(values[0]);
+        return;
+    }
+
+    // Allocate temporary storage for cumulative products
+    // Max num_batches is typically ~20, so stack allocation is fine
+    CM31 products[32];  // Support up to 32 batches
+
+    // Forward pass: Compute cumulative products
+    products[0] = values[0];
+    for (uint i = 1; i < count; i++) {
+        products[i] = cm31_mul(products[i - 1], values[i]);
+    }
+
+    // Invert the final cumulative product (single inversion)
+    CM31 inverse = cm31_inverse(products[count - 1]);
+
+    // Backward pass: Compute individual inverses
+    for (uint i = count - 1; i > 0; i--) {
+        values[i] = cm31_mul(products[i - 1], inverse);
+        inverse = cm31_mul(inverse, values[i]);
+    }
+    values[0] = inverse;
+}
+
+/// Quotient accumulation kernel with GPU-native batch inversion.
 ///
 /// Computes Q(x) = Σ_i (random_coeff^i * (P_i(x) - y_i) / (x - x_i))
 ///
 /// For each domain point, accumulates quotient terms from all sample batches.
-/// Denominator inverses are computed on-the-fly using CM31 batch inversion.
+/// Uses Montgomery's trick to batch-invert denominators (GPU-native, no CPU round-trip).
+///
+/// Algorithmic improvement: O(num_batches) inversions per thread → O(1) inversion per thread
 ///
 /// Layout:
 /// - domain_points_x/y: Domain point coordinates (BaseField), bit-reversed order
@@ -927,19 +967,16 @@ kernel void quotient_accumulate(
     uint32_t domain_x = domain_points_x[tid];
     uint32_t domain_y = domain_points_y[tid];
 
-    // Initialize accumulator
-    QM31 accumulator = qm31_zero();
+    // PHASE 1: Compute all denominators for this domain point
+    // Stack-allocate array for denominators (num_batches is typically ~5-20)
+    CM31 denominators[32];  // Support up to 32 batches
 
-    // Process each sample batch
-    uint line_coeff_offset = 0;
     for (uint batch_idx = 0; batch_idx < num_batches; batch_idx++) {
-        uint batch_size = batch_sizes[batch_idx];
-
         // Get sample point (QM31)
         QM31 sample_x = sample_points_x[batch_idx];
         QM31 sample_y = sample_points_y[batch_idx];
 
-        // Compute denominator inverse
+        // Compute denominator
         // denominator = (sample.x - domain.x) * sample.y.1 - (sample.y - domain.y) * sample.x.1
         // Where sample.x = (sample.x.0, sample.x.1) in CM31
         CM31 sample_xr = sample_x.c0;  // Real part
@@ -950,8 +987,22 @@ kernel void quotient_accumulate(
         CM31 dx = cm31_sub(sample_xr, cm31_from_m31(domain_x));
         CM31 dy = cm31_sub(sample_yr, cm31_from_m31(domain_y));
 
-        CM31 denominator = cm31_sub(cm31_mul(dx, sample_yi), cm31_mul(dy, sample_xi));
-        CM31 denominator_inv = cm31_inverse(denominator);
+        denominators[batch_idx] = cm31_sub(cm31_mul(dx, sample_yi), cm31_mul(dy, sample_xi));
+    }
+
+    // PHASE 2: Batch invert all denominators using Montgomery's trick
+    // Reduces O(num_batches) individual inversions to O(1) + overhead
+    cm31_batch_inverse_inplace(denominators, num_batches);
+
+    // PHASE 3: Accumulate quotient using pre-computed inverses
+    QM31 accumulator = qm31_zero();
+    uint line_coeff_offset = 0;
+
+    for (uint batch_idx = 0; batch_idx < num_batches; batch_idx++) {
+        uint batch_size = batch_sizes[batch_idx];
+
+        // Get pre-computed denominator inverse
+        CM31 denominator_inv = denominators[batch_idx];
 
         // Accumulate numerator for this batch
         QM31 numerator = qm31_zero();
