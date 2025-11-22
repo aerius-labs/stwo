@@ -1,7 +1,4 @@
-//! Metal quotient operations (QuotientOps trait implementation).
-//!
-//! This module implements quotient accumulation with GPU acceleration for large workloads
-//! and SIMD fallback for small workloads.
+//! Metal quotient operations.
 
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
@@ -76,7 +73,7 @@ impl QuotientOps for MetalBackend {
         let columns_pooled = ctx.checkout_shared_buffer(columns_buffer_size);
         let columns_buffer = columns_pooled.buffer();
 
-        // Flatten line coefficients and build metadata (CPU work, independent of GPU blit)
+        // Flatten line coefficients and build metadata
         let mut line_coeffs_flat = Vec::new();
         let mut column_indices = Vec::new();
         let mut batch_sizes = Vec::new();
@@ -130,7 +127,6 @@ impl QuotientOps for MetalBackend {
         }
 
         // Dispatch to Metal GPU
-        // (columns_buffer already created via GPU blit above, device/command_queue already obtained)
 
         let column_indices_buffer = device.new_buffer_with_data(
             column_indices.as_ptr() as *const _,
@@ -167,7 +163,7 @@ impl QuotientOps for MetalBackend {
         let output_pooled = ctx.checkout_shared_buffer(output_size);
         let output_buffer = output_pooled.buffer();
 
-        // Fuse blit + quotient kernel into single command buffer (eliminates one synchronization point)
+        // Fuse blit + quotient kernel into single command buffer
         let command_buffer = command_queue.new_command_buffer();
 
         // Step 1: Blit encoder to flatten columns on GPU
@@ -186,7 +182,7 @@ impl QuotientOps for MetalBackend {
         }
         blit_encoder.end_encoding();
 
-        // Step 2: Quotient kernel (automatically waits for blit to complete via Metal dependencies)
+        // Step 2: Quotient kernel
         let encoder = command_buffer.new_compute_command_encoder();
 
         let pipeline = ctx.quotient_pipeline();
@@ -195,7 +191,6 @@ impl QuotientOps for MetalBackend {
         encoder.set_buffer(0, Some(&domain_x_buffer), 0);
         encoder.set_buffer(1, Some(&domain_y_buffer), 0);
         encoder.set_buffer(2, Some(&columns_buffer), 0);
-        // Convert to u32 before passing to Metal to avoid UB from casting usize to u32 pointer
         let num_columns_u32 = num_columns as u32;
         encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &num_columns_u32 as *const u32 as *const _);
         let domain_size_u32 = domain_size as u32;
@@ -226,7 +221,7 @@ impl QuotientOps for MetalBackend {
             eprintln!("[CPU_PROFILE] quotient_gpu_wait | time={:.3}ms", _gpu_timer.elapsed().as_secs_f64() * 1000.0);
         }
 
-        // Convert output buffer directly to SecureColumnByCoords - zero-copy
+        // Convert output buffer to SecureColumnByCoords
         let values = unsafe {
             SecureColumnByCoords::from_qm31_interleaved_buffer(&output_buffer, domain_size)
         };

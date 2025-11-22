@@ -396,7 +396,6 @@ impl MetalContext {
     }
 
     /// Check out a private (GPU-only) memory buffer from the pool.
-    #[allow(dead_code)]
     pub fn checkout_private_buffer(&self, size: u64) -> super::buffer_pool::PooledBuffer {
         self.buffer_pools.private.checkout(size)
     }
@@ -445,11 +444,6 @@ impl MetalContext {
     }
 
     /// Get or create cached domain evaluation point buffers (x, y) in bit-reversed order.
-    ///
-    /// This caches the expensive domain point computation for reuse across multiple
-    /// quotient accumulation calls with the same domain size.
-    ///
-    /// Returns (x_buffer, y_buffer) where each contains M31 values (u32).
     pub fn get_or_create_domain_xy_buffers(&self, domain: CircleDomain) -> (Buffer, Buffer) {
         let log_size = domain.log_size();
         let cache_key = log_size;
@@ -495,20 +489,12 @@ impl MetalContext {
         (x_buffer, y_buffer)
     }
 
-    /// Get MTLResourceOptions for shared memory (unified memory on Apple Silicon).
-    ///
-    /// This uses MTLStorageModeShared which allows both CPU and GPU to access
-    /// the same memory without explicit copies.
+    /// Get MTLResourceOptions for shared memory.
     pub fn shared_resource_options() -> MTLResourceOptions {
         MTLResourceOptions::StorageModeShared
     }
 
     /// Pack 4 coordinate columns into QM31 interleaved format using GPU.
-    ///
-    /// Layout: [a0, b0, c0, d0, a1, b1, c1, d1, ...]
-    /// where each QM31 = {CM31(a,b), CM31(c,d)} and each M31 is stored as u32.
-    ///
-    /// This replaces the CPU loop in `SecureColumnByCoords::as_qm31_interleaved_u32_buffer`.
     pub fn pack_coords_to_qm31(
         &self,
         col0: &super::column::MetalBaseColumn,
@@ -545,9 +531,6 @@ impl MetalContext {
     }
 
     /// Unpack QM31 interleaved format into 4 coordinate columns using GPU.
-    ///
-    /// This is the inverse of `pack_coords_to_qm31`.
-    /// Replaces the CPU loop in `SecureColumnByCoords::from_qm31_interleaved_buffer`.
     pub fn unpack_qm31_to_coords(
         &self,
         src: &Buffer,

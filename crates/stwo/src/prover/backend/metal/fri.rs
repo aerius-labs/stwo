@@ -1,7 +1,4 @@
-//! Metal FRI operations (FriOps trait implementation).
-//!
-//! This module implements FRI folding operations with GPU acceleration for large workloads
-//! and SIMD fallback for small workloads.
+//! Metal FRI operations.
 
 use metal::MTLResourceOptions;
 
@@ -226,9 +223,6 @@ impl FriOps for MetalBackend {
         let domain_size = eval.len();
         let half_size = domain_size / 2;
 
-        // Compute decomposition coefficient lambda using GPU parallel reduction
-        // lambda = (b_sum - a_sum) / (2 * domain_size)
-        // where a_sum = sum of first half, b_sum = sum of second half
         let lambda = {
             let ctx = MetalContext::global();
             let device = ctx.device();
@@ -278,7 +272,7 @@ impl FriOps for MetalBackend {
             command_buffer.commit();
             command_buffer.wait_until_completed();
 
-            // Sum partial results on CPU (small array, only num_threadgroups*2 elements)
+            // Sum partial results on CPU
             let partial_sums_ptr = partial_sums_buffer.contents() as *const [u32; 4];
             let mut a_sum = SecureField::from(BaseField::from(0));
             let mut b_sum = SecureField::from(BaseField::from(0));
@@ -294,9 +288,6 @@ impl FriOps for MetalBackend {
             (b_sum - a_sum) / SecureField::from(BaseField::from(2 * domain_size as u32))
         };
 
-        // Apply decompose formula on GPU:
-        // g[i] = eval[i] - lambda  (for i < half_size)
-        // g[i] = eval[i] + lambda  (for i >= half_size)
         let ctx = MetalContext::global();
         let device = ctx.device();
 

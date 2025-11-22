@@ -1,6 +1,4 @@
-//! Metal GKR and MLE operations (GkrOps and MleOps trait implementations).
-//!
-//! This module implements GKR (Grand product and lookup) operations with MLE support.
+//! Metal GKR and MLE operations.
 
 use metal::MTLResourceOptions;
 
@@ -219,7 +217,6 @@ impl MleOps<SecureField> for MetalBackend {
 
 impl GkrOps for MetalBackend {
     fn gen_eq_evals(y: &[SecureField], v: SecureField) -> Mle<Self, SecureField> {
-        // TODO(Phase 4): Dispatch to Metal GPU for large MLE operations
         let simd_result = SimdBackend::gen_eq_evals(y, v);
 
         // Convert result from SIMD to Metal
@@ -229,8 +226,6 @@ impl GkrOps for MetalBackend {
     }
 
     fn next_layer(layer: &Layer<Self>) -> Layer<Self> {
-        // TODO(Phase 4): Layer transitions could use Metal GPU
-        // For now, delegate to CPU backend like SIMD does
         use crate::prover::backend::cpu::CpuBackend;
 
         // Convert Metal layer to CPU, process, convert back
@@ -272,7 +267,6 @@ impl GkrOps for MetalBackend {
         h: &GkrMultivariatePolyOracle<'_, Self>,
         claim: SecureField,
     ) -> UnivariatePoly<SecureField> {
-        // Polynomial summation uses SIMD, transmute types
         let simd_h: &GkrMultivariatePolyOracle<'_, SimdBackend> =
             unsafe { &*(h as *const _ as *const _) };
         SimdBackend::sum_as_poly_in_first_variable(simd_h, claim)

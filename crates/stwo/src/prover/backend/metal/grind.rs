@@ -1,6 +1,4 @@
-//! Metal proof-of-work grinding operations (GrindOps trait implementation).
-//!
-//! This module implements GPU-accelerated PoW grinding using Metal compute shaders.
+//! Metal proof-of-work grinding operations.
 
 use bytemuck::cast_slice;
 use metal::MTLResourceOptions;
@@ -133,10 +131,6 @@ impl<const IS_M31_OUTPUT: bool> GrindOps<Blake2sChannelGeneric<IS_M31_OUTPUT>> f
 // Uses the same GPU grinding logic as CPU channel since digest format is compatible
 impl<const IS_M31_OUTPUT: bool> GrindOps<MetalBlake2sChannelGeneric<IS_M31_OUTPUT>> for MetalBackend {
     fn grind(channel: &MetalBlake2sChannelGeneric<IS_M31_OUTPUT>, pow_bits: u32) -> u64 {
-        // Always use GPU grinding for GPU channel (no SIMD fallback)
-        // If user chose GPU channel, they want GPU operations
-
-        // TODO: support more than 32 bits
         assert!(pow_bits <= 32, "pow_bits > 32 is not supported");
 
         let digest = channel.digest();
@@ -248,7 +242,6 @@ pub mod poseidon252 {
 
     impl GrindOps<Poseidon252Channel> for MetalBackend {
         fn grind(channel: &Poseidon252Channel, pow_bits: u32) -> u64 {
-            // Poseidon252 grinding uses SIMD
             SimdBackend::grind(channel, pow_bits)
         }
     }

@@ -1,6 +1,4 @@
-//! Metal accumulation operations (AccumulationOps trait implementation).
-//!
-//! This module implements field accumulation operations using GPU acceleration.
+//! Metal accumulation operations.
 
 use crate::core::fields::qm31::SecureField;
 use crate::prover::backend::simd::SimdBackend;
@@ -54,7 +52,6 @@ impl AccumulationOps for MetalBackend {
     }
 
     fn generate_secure_powers(felt: SecureField, n_powers: usize) -> Vec<SecureField> {
-        // Power generation uses SIMD (no backend-specific types)
         SimdBackend::generate_secure_powers(felt, n_powers)
     }
 }

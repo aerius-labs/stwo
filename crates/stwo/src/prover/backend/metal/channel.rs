@@ -19,19 +19,7 @@ use super::context::MetalContext;
 const BLAKE_BYTES_PER_HASH: usize = 32;
 const FELTS_PER_HASH: usize = 8;
 
-/// GPU-resident Blake2s channel with Metal compute kernels (generic over M31 output mode).
-///
-/// Unlike the CPU channel, this keeps the digest buffer on the GPU
-/// and performs all Blake2s operations via Metal kernels.
-///
-/// # State Management
-/// - `digest_buffer`: GPU buffer holding current digest (32 bytes = 8 u32s)
-/// - `n_draws`: CPU counter incremented on each draw operation
-/// - `is_m31_output`: Whether to reduce hash output modulo M31::P
-///
-/// # Memory Model
-/// Uses MTLStorageModeShared for unified memory on Apple Silicon,
-/// allowing both CPU and GPU to access the digest buffer efficiently.
+/// GPU-resident Blake2s channel with Metal compute kernels.
 pub struct MetalBlake2sChannelGeneric<const IS_M31_OUTPUT: bool> {
     /// Metal context for kernel dispatch.
     context: Arc<MetalContext>,
@@ -99,11 +87,6 @@ impl<const IS_M31_OUTPUT: bool> MetalBlake2sChannelGeneric<IS_M31_OUTPUT> {
     }
 
     /// Mix data into channel state using GPU kernel.
-    ///
-    /// Computes: new_digest = Blake2s(old_digest || data)
-    ///
-    /// This dispatches the `blake2s_channel_mix` kernel with a single thread.
-    /// Expected execution time: <0.3ms based on Merkle kernel performance.
     pub fn gpu_mix_root(&mut self, root: &Blake2sHash) {
         let _timer = if super::profiling::is_profiling_enabled() {
             Some(super::profiling::ScopedTimer::new(
@@ -166,10 +149,6 @@ impl<const IS_M31_OUTPUT: bool> MetalBlake2sChannelGeneric<IS_M31_OUTPUT> {
     }
 
     /// Draw random u32s using GPU kernel.
-    ///
-    /// Computes: output = Blake2s(digest || counter || 0x00)
-    ///
-    /// Returns 8 u32s per call, increments counter.
     fn gpu_draw_u32s(&mut self) -> Vec<u32> {
         let _timer = if super::profiling::is_profiling_enabled() {
             Some(super::profiling::ScopedTimer::new(
@@ -234,9 +213,6 @@ impl<const IS_M31_OUTPUT: bool> MetalBlake2sChannelGeneric<IS_M31_OUTPUT> {
     }
 
     /// Draw base field elements with rejection sampling.
-    ///
-    /// Repeats hashing with increasing counter until all values are valid M31.
-    /// Retry probability per round is ~2^(-28).
     fn draw_base_felts(&mut self) -> [BaseField; FELTS_PER_HASH] {
         loop {
             let u32s: [u32; FELTS_PER_HASH] = self.gpu_draw_u32s().try_into().unwrap();
@@ -298,10 +274,6 @@ impl<const IS_M31_OUTPUT: bool> std::fmt::Debug for MetalBlake2sChannelGeneric<I
             .finish()
     }
 }
-
-// ============================================================================
-// Channel Trait Implementation
-// ============================================================================
 
 impl<const IS_M31_OUTPUT: bool> Channel for MetalBlake2sChannelGeneric<IS_M31_OUTPUT> {
     const BYTES_PER_HASH: usize = BLAKE_BYTES_PER_HASH;
@@ -393,18 +365,11 @@ pub type MetalBlake2sChannel = MetalBlake2sChannelGeneric<false>;
 /// Type alias for GPU channel with M31-reduced output.
 pub type MetalBlake2sM31Channel = MetalBlake2sChannelGeneric<true>;
 
-// ============================================================================
-// MerkleChannel Implementation for GPU Channel
-// ============================================================================
-
 use crate::core::channel::MerkleChannel;
 use crate::core::vcs::blake2_merkle::{Blake2sMerkleHasherGeneric};
 use crate::core::vcs::MerkleHasher;
 
 /// GPU-accelerated Merkle channel using Metal compute kernels.
-///
-/// This eliminates CPU-GPU round-trips in the FRI loop by keeping
-/// the channel state on the GPU and using the blake2s_channel_mix kernel.
 #[derive(Default)]
 pub struct MetalBlake2sMerkleChannelGeneric<const IS_M31_OUTPUT: bool>;
 
@@ -413,7 +378,6 @@ impl<const IS_M31_OUTPUT: bool> MerkleChannel for MetalBlake2sMerkleChannelGener
     type H = Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>;
 
     fn mix_root(channel: &mut Self::C, root: <Self::H as MerkleHasher>::Hash) {
-        // Use GPU kernel for mixing root into channel
         channel.gpu_mix_root(&root);
     }
 }

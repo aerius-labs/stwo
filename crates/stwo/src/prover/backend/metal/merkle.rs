@@ -1,7 +1,4 @@
-//! Metal Merkle operations (MerkleOps trait implementation).
-//!
-//! This module implements Merkle tree construction with GPU acceleration for large workloads
-//! and SIMD fallback for small workloads.
+//! Metal Merkle operations.
 
 use metal::{Buffer, MTLResourceOptions};
 use std::sync::{Arc, Mutex};
@@ -18,7 +15,6 @@ use super::thresholds::MIN_MERKLE_LOG_SIZE;
 use super::MetalBackend;
 
 /// Lazy GPU-backed column for Blake2s hashes.
-/// Defers synchronization until data is actually accessed.
 #[derive(Clone)]
 pub struct MetalBlake2sColumn {
     buffer: Buffer,
@@ -180,11 +176,6 @@ impl FromIterator<Blake2sHash> for MetalBlake2sColumn {
 }
 
 /// Build complete Merkle tree in a single GPU submission.
-/// This is more efficient than layer-by-layer construction as it:
-/// 1. Pre-allocates all buffers upfront
-/// 2. Submits all layers in a single command buffer
-/// 3. Lets Metal driver schedule layer dependencies automatically
-#[allow(dead_code)]
 fn commit_tree_batched<H: Into<bool>>(
     ctx: &MetalContext,
     initial_layer: Vec<Blake2sHash>,
@@ -570,14 +561,13 @@ impl MerkleOps<Blake2sM31MerkleHasher> for MetalBackend {
     }
 
     /// Batched commit for multiple consecutive node-only layers.
-    /// With lazy sync, layer-by-layer is efficient since GPU work is queued without waits.
     fn commit_node_layers_batched(
         initial_layer: &Col<Self, Blake2sHash>,
         num_layers: u32,
     ) -> Vec<Col<Self, Blake2sHash>> {
         let _timer = crate::metal_profile_fn!("merkle_m31_batched", "GPU", num_layers = num_layers, initial_size = initial_layer.len());
 
-        // Use layer-by-layer with lazy sync (GPU work queued without synchronization)
+        // Use layer-by-layer with lazy sync
         Self::commit_node_layers_batched_default(initial_layer, num_layers)
     }
 }

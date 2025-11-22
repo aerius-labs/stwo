@@ -3,12 +3,6 @@
 //! These column types use `MTLStorageModeShared` which provides unified memory
 //! access on Apple Silicon - the same memory is accessible by both CPU and GPU
 //! without explicit copies.
-//!
-//! NOTE: These types are NOT used in Phase 1 (MetalBackend uses SIMD columns).
-//! They are experimental types for future Phase 2 optimization.
-
-// Allow dead code since these types are not used in Phase 1
-#[allow(dead_code)]
 
 use metal::{Buffer, MTLResourceOptions};
 use std::fmt::Debug;
@@ -21,8 +15,6 @@ use crate::prover::backend::simd::SimdBackend;
 use crate::prover::secure_column::SecureColumnByCoords;
 
 /// A view into a GPU buffer representing a subrange without copying.
-///
-/// This allows referencing parts of Metal buffers efficiently for pipeline operations.
 #[derive(Clone, Debug)]
 pub struct GpuSlice {
     /// The underlying Metal buffer
@@ -69,10 +61,7 @@ impl GpuSlice {
 }
 
 /// Metal-backed column for base field elements (M31).
-///
-/// Uses shared memory buffer accessible by both CPU and GPU.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct MetalBaseColumn {
     /// Metal buffer in shared memory.
     buffer: Buffer,
@@ -218,11 +207,7 @@ impl FromIterator<BaseField> for MetalBaseColumn {
 }
 
 /// Metal-backed column for secure field elements (QM31).
-///
-/// SecureField is represented as 4 BaseField elements, so we store
-/// it as a flat buffer of BaseField elements with length 4x.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct MetalSecureColumn {
     /// Metal buffer in shared memory (stores 4 * len BaseField elements).
     buffer: Buffer,
@@ -389,12 +374,7 @@ impl SecureColumnByCoords<MetalBackend> {
         }
     }
 
-    /// Create an interleaved QM31 buffer (4 u32s per element) from coordinate columns.
-    ///
-    /// Layout: [a0, b0, c0, d0, a1, b1, c1, d1, ...]
-    /// where each QM31 = {CM31(a,b), CM31(c,d)} and each M31 is stored as u32.
-    ///
-    /// Uses GPU kernel to pack coordinate columns into interleaved format.
+    /// Create an interleaved QM31 buffer from coordinate columns.
     pub fn as_qm31_interleaved_u32_buffer(&self) -> Buffer {
         let ctx = MetalContext::global();
         ctx.pack_coords_to_qm31(
@@ -406,9 +386,6 @@ impl SecureColumnByCoords<MetalBackend> {
     }
 
     /// Create a SecureColumnByCoords from an interleaved QM31 buffer.
-    ///
-    /// This is the inverse of `as_qm31_interleaved_u32_buffer`.
-    /// Uses GPU kernel to unpack interleaved format into coordinate columns.
     pub unsafe fn from_qm31_interleaved_buffer(buffer: &Buffer, len: usize) -> Self {
         let ctx = MetalContext::global();
         let columns = ctx.unpack_qm31_to_coords(buffer, len);

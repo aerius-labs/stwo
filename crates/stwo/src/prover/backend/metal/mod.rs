@@ -20,7 +20,7 @@
 //! - Threadgroup (shared) memory used for FFT tiles and reductions
 //! - Falls back to SIMD/CPU for small workloads (below threshold)
 //!
-//! # GPU-Resident Channel State (Educational - Not Recommended)
+//! # GPU-Resident Channel State
 //!
 //! The backend provides `MetalBlake2sM31MerkleChannel` which keeps the Fiat-Shamir
 //! channel digest on the GPU, eliminating CPU-GPU round-trips during proof generation.
@@ -28,8 +28,7 @@
 //! updated with Merkle roots.
 //!
 //! ## Usage Example
-//! This implementation serves as an educational example of when NOT to use GPU
-//! acceleration. See `channel.rs` module documentation for detailed analysis.
+//! See `channel.rs` module documentation for detailed analysis.
 //!
 //! ```rust,ignore
 //! use stwo::prover::backend::metal::{MetalBackend, MetalBlake2sM31Channel, MetalBlake2sM31MerkleChannel};
@@ -149,33 +148,6 @@ impl BackendForChannel<MetalBlake2sMerkleChannel> for MetalBackend {}
 
 #[cfg(target_os = "macos")]
 impl BackendForChannel<MetalBlake2sM31MerkleChannel> for MetalBackend {}
-
-// ============================================================================
-// PHASE 1 ARCHITECTURE DECISION: MetalBackend = "SIMD + GPU Helpers"
-// ============================================================================
-//
-// For Phase 1, MetalBackend uses SIMD's column types (BaseColumn/SecureColumn)
-// and delegates most operations to SimdBackend, with GPU acceleration for:
-// - FFT/IFFT (metal/poly.rs)
-// - FRI folding (metal/fri.rs)
-// - Quotient accumulation (metal/quotients.rs)
-// - Merkle tree hashing (metal/merkle.rs)
-// - PoW grinding (metal/grind.rs)
-// - GKR MLE operations (metal/gkr.rs)
-//
-// This design allows Metal GPU kernels to work on data copied from SIMD columns,
-// avoiding the complexity of managing GPU-backed column types in Phase 1.
-//
-// MetalBaseColumn/MetalSecureColumn exist in column.rs but are NOT used in the
-// actual proving path - they're experimental types for future Phase 2 optimization.
-//
-// IMPORTANT: All `unsafe transmute` between SimdBackend and MetalBackend types
-// are SAFE because both use identical column representations (BaseColumn/SecureColumn).
-// However, this invariant MUST be maintained - if column types diverge, transmutes
-// become UB.
-//
-// Future Phase 2: Switch to GPU-backed columns for zero-copy Metal operations.
-// ============================================================================
 
 #[cfg(target_os = "macos")]
 impl ColumnOps<BaseField> for MetalBackend {
