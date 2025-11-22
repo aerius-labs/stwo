@@ -497,6 +497,21 @@ kernel void ifft_normalize_m31(
     data[gid] = m31_mul(val, n_inv);
 }
 
+/// Accumulate M31 columns: dst += src (elementwise)
+///
+/// This kernel adds src to dst elementwise for M31 values.
+/// Used for accumulating coordinate columns in SecureColumnByCoords.
+/// Each thread processes one M31 element.
+kernel void accumulate_m31(
+    device uint32_t* dst [[buffer(0)]],        // Destination column (count elements)
+    device const uint32_t* src [[buffer(1)]],  // Source column (count elements)
+    constant uint32_t& count [[buffer(2)]],    // Number of M31 elements
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) return;
+    dst[gid] = m31_add(dst[gid], src[gid]);
+}
+
 /// Fused vecwise FFT kernel for layers 1-4.
 ///
 /// Processes 4 consecutive radix-2 layers in a single kernel using threadgroup memory.
@@ -1563,4 +1578,98 @@ kernel void fri_decompose(
 
     // Write output (QM31)
     output_qm31[gid] = output_val;
+}
+
+/// Compute two partial sums for FRI decompose (first half and second half).
+/// Uses parallel reduction with threadgroup_size threads per group.
+/// Each threadgroup produces one partial sum for first half and one for second half.
+/// Output: array of QM31 partial sums [a_partial_0, b_partial_0, a_partial_1, b_partial_1, ...]
+kernel void fri_decompose_sum(
+    device const QM31* input [[buffer(0)]],         // Input QM31 array
+    device QM31* partial_sums [[buffer(1)]],        // Output partial sums (2 per threadgroup)
+    constant uint32_t& half_size [[buffer(2)]],     // Half of domain size
+    constant uint32_t& grid_size [[buffer(3)]],     // Total threads in grid
+    uint gid [[thread_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]]
+) {
+    // Shared memory for reduction within threadgroup
+    threadgroup QM31 shared_a[256];
+    threadgroup QM31 shared_b[256];
+
+    QM31 zero = {0, 0, 0, 0};
+
+    // Each thread sums elements assigned to it
+    QM31 local_a = zero;
+    QM31 local_b = zero;
+
+    // Grid-stride loop to handle arrays larger than grid size
+    uint domain_size = half_size * 2;
+    for (uint i = gid; i < domain_size; i += grid_size) {
+        QM31 val = input[i];
+        if (i < half_size) {
+            local_a = qm31_add(local_a, val);
+        } else {
+            local_b = qm31_add(local_b, val);
+        }
+    }
+
+    // Store local sums to shared memory
+    shared_a[tid] = local_a;
+    shared_b[tid] = local_b;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel reduction within threadgroup (fixed size 256)
+    if (tid < 128) {
+        shared_a[tid] = qm31_add(shared_a[tid], shared_a[tid + 128]);
+        shared_b[tid] = qm31_add(shared_b[tid], shared_b[tid + 128]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 64) {
+        shared_a[tid] = qm31_add(shared_a[tid], shared_a[tid + 64]);
+        shared_b[tid] = qm31_add(shared_b[tid], shared_b[tid + 64]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 32) {
+        shared_a[tid] = qm31_add(shared_a[tid], shared_a[tid + 32]);
+        shared_b[tid] = qm31_add(shared_b[tid], shared_b[tid + 32]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 16) {
+        shared_a[tid] = qm31_add(shared_a[tid], shared_a[tid + 16]);
+        shared_b[tid] = qm31_add(shared_b[tid], shared_b[tid + 16]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 8) {
+        shared_a[tid] = qm31_add(shared_a[tid], shared_a[tid + 8]);
+        shared_b[tid] = qm31_add(shared_b[tid], shared_b[tid + 8]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 4) {
+        shared_a[tid] = qm31_add(shared_a[tid], shared_a[tid + 4]);
+        shared_b[tid] = qm31_add(shared_b[tid], shared_b[tid + 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 2) {
+        shared_a[tid] = qm31_add(shared_a[tid], shared_a[tid + 2]);
+        shared_b[tid] = qm31_add(shared_b[tid], shared_b[tid + 2]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 1) {
+        shared_a[tid] = qm31_add(shared_a[tid], shared_a[tid + 1]);
+        shared_b[tid] = qm31_add(shared_b[tid], shared_b[tid + 1]);
+    }
+
+    // Thread 0 writes threadgroup's partial sum
+    if (tid == 0) {
+        partial_sums[tg_id * 2] = shared_a[0];
+        partial_sums[tg_id * 2 + 1] = shared_b[0];
+    }
 }

@@ -226,18 +226,73 @@ impl FriOps for MetalBackend {
         let domain_size = eval.len();
         let half_size = domain_size / 2;
 
-        // Compute decomposition coefficient lambda on CPU (small reduction, not worth GPU overhead)
+        // Compute decomposition coefficient lambda using GPU parallel reduction
         // lambda = (b_sum - a_sum) / (2 * domain_size)
         // where a_sum = sum of first half, b_sum = sum of second half
-        let mut a_sum = SecureField::from(BaseField::from(0));
-        let mut b_sum = SecureField::from(BaseField::from(0));
-        for i in 0..half_size {
-            a_sum += eval.values.at(i);
-        }
-        for i in half_size..domain_size {
-            b_sum += eval.values.at(i);
-        }
-        let lambda = (b_sum - a_sum) / SecureField::from(BaseField::from(2 * domain_size as u32));
+        let lambda = {
+            let ctx = MetalContext::global();
+            let device = ctx.device();
+
+            // Pack input to QM31 for GPU
+            let input_qm31_size = (domain_size * 4 * std::mem::size_of::<u32>()) as u64;
+            let input_pooled = ctx.checkout_shared_buffer(input_qm31_size);
+            let input_buffer = input_pooled.buffer();
+
+            // Allocate buffer for partial sums (2 QM31 per threadgroup)
+            let num_threadgroups = 256usize;  // Use 256 threadgroups
+            let partial_sums_size = (num_threadgroups * 2 * 4 * std::mem::size_of::<u32>()) as u64;
+            let partial_sums_buffer = device.new_buffer(
+                partial_sums_size,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let command_buffer = ctx.command_queue().new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+
+            // Pack coordinates to QM31
+            ctx.pack_coords_to_qm31_batched(
+                &encoder,
+                &eval.values.columns[0],
+                &eval.values.columns[1],
+                &eval.values.columns[2],
+                &eval.values.columns[3],
+                &input_buffer,
+            );
+
+            // Dispatch parallel reduction kernel
+            encoder.set_compute_pipeline_state(ctx.fri_decompose_sum_pipeline());
+            encoder.set_buffer(0, Some(&input_buffer), 0);
+            encoder.set_buffer(1, Some(&partial_sums_buffer), 0);
+            let half_size_u32 = half_size as u32;
+            encoder.set_bytes(2, std::mem::size_of::<u32>() as u64, &half_size_u32 as *const u32 as *const _);
+            let grid_size = num_threadgroups * 256;
+            let grid_size_u32 = grid_size as u32;
+            encoder.set_bytes(3, std::mem::size_of::<u32>() as u64, &grid_size_u32 as *const u32 as *const _);
+
+            encoder.dispatch_thread_groups(
+                metal::MTLSize { width: num_threadgroups as u64, height: 1, depth: 1 },
+                metal::MTLSize { width: 256, height: 1, depth: 1 },
+            );
+
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+
+            // Sum partial results on CPU (small array, only num_threadgroups*2 elements)
+            let partial_sums_ptr = partial_sums_buffer.contents() as *const [u32; 4];
+            let mut a_sum = SecureField::from(BaseField::from(0));
+            let mut b_sum = SecureField::from(BaseField::from(0));
+            for i in 0..num_threadgroups {
+                let a_qm31 = unsafe { &*partial_sums_ptr.offset((i * 2) as isize) };
+                let b_qm31 = unsafe { &*partial_sums_ptr.offset((i * 2 + 1) as isize) };
+                a_sum += SecureField::from_m31_array(std::array::from_fn(|j| BaseField::from(a_qm31[j])));
+                b_sum += SecureField::from_m31_array(std::array::from_fn(|j| BaseField::from(b_qm31[j])));
+            }
+
+            drop(input_pooled);
+
+            (b_sum - a_sum) / SecureField::from(BaseField::from(2 * domain_size as u32))
+        };
 
         // Apply decompose formula on GPU:
         // g[i] = eval[i] - lambda  (for i < half_size)

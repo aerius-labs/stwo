@@ -57,18 +57,35 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
         class = "CompositionPolynomialGeneration"
     )
     .entered();
+
+    let _comp_start = if std::env::var("METAL_PROFILE").is_ok() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let composition_poly = component_provers.compute_composition_polynomial(random_coeff, &trace);
     let composition_log_size = composition_poly.log_size();
+    if let Some(start) = _comp_start {
+        eprintln!("[CPU_PROFILE] compute_composition_polynomial | time={:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+    }
     span1.exit();
 
     // Commit on the Composition Polynomial by splitting its coeffs to two polynomialsof degree
     // half the size of the original polynomial, and commit on each half separately.
+    let _commit_start = if std::env::var("METAL_PROFILE").is_ok() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let mut tree_builder = commitment_scheme.tree_builder();
     let (left_comp_poly_half, right_comp_poly_half) = composition_poly.split_at_mid();
 
     tree_builder.extend_polys(left_comp_poly_half.into_coordinate_polys());
     tree_builder.extend_polys(right_comp_poly_half.into_coordinate_polys());
     tree_builder.commit(channel);
+    if let Some(start) = _commit_start {
+        eprintln!("[CPU_PROFILE] composition_commit | time={:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+    }
     span.exit();
 
     // Draw OODS point.
@@ -81,7 +98,15 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     sample_points.push(vec![vec![oods_point]; 2 * SECURE_EXTENSION_DEGREE]);
 
     // Prove the trace and composition OODS values, and retrieve them.
+    let _prove_start = if std::env::var("METAL_PROFILE").is_ok() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let commitment_scheme_proof = commitment_scheme.prove_values(sample_points, channel);
+    if let Some(start) = _prove_start {
+        eprintln!("[CPU_PROFILE] prove_values (FRI) | time={:.3}ms", start.elapsed().as_secs_f64() * 1000.0);
+    }
     let proof = StarkProof(commitment_scheme_proof.proof);
     info!(proof_size_estimate = proof.size_estimate());
 

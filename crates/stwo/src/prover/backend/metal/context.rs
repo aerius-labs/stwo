@@ -77,6 +77,9 @@ pub struct MetalContext {
     /// FRI decompose kernel pipeline.
     fri_decompose_pipeline: ComputePipelineState,
 
+    /// FRI decompose sum reduction kernel (parallel sum for lambda computation).
+    fri_decompose_sum_pipeline: ComputePipelineState,
+
     /// Quotient accumulation kernel pipeline.
     quotient_pipeline: ComputePipelineState,
 
@@ -112,6 +115,9 @@ pub struct MetalContext {
 
     /// GPU Blake2s channel draw kernel (for GPU-resident Fiat-Shamir state).
     blake2s_channel_draw_pipeline: ComputePipelineState,
+
+    /// M31 accumulation kernel (dst += src elementwise).
+    accumulate_m31_pipeline: ComputePipelineState,
 
     /// Cache for twiddle factor buffers.
     /// Key is a hash of the twiddle data, value is the Metal buffer.
@@ -169,6 +175,7 @@ impl MetalContext {
             Self::create_pipeline(&device, &library, "fri_fold_circle_into_line")?;
         let fri_fold_line_pipeline = Self::create_pipeline(&device, &library, "fri_fold_line")?;
         let fri_decompose_pipeline = Self::create_pipeline(&device, &library, "fri_decompose")?;
+        let fri_decompose_sum_pipeline = Self::create_pipeline(&device, &library, "fri_decompose_sum")?;
         let quotient_pipeline = Self::create_pipeline(&device, &library, "quotient_accumulate")?;
         let merkle_pipeline = Self::create_pipeline(&device, &library, "merkle_blake2s")?;
         let merkle_leaf_pipeline = Self::create_pipeline(&device, &library, "merkle_blake2s_leaf")?;
@@ -181,6 +188,7 @@ impl MetalContext {
         let fri_fold_circle_into_line_coords_pipeline = Self::create_pipeline(&device, &library, "fri_fold_circle_into_line_coords")?;
         let blake2s_channel_mix_pipeline = Self::create_pipeline(&device, &library, "blake2s_channel_mix")?;
         let blake2s_channel_draw_pipeline = Self::create_pipeline(&device, &library, "blake2s_channel_draw")?;
+        let accumulate_m31_pipeline = Self::create_pipeline(&device, &library, "accumulate_m31")?;
 
         let buffer_pools = GlobalPools::new(device.clone());
 
@@ -197,6 +205,7 @@ impl MetalContext {
             fri_fold_circle_pipeline,
             fri_fold_line_pipeline,
             fri_decompose_pipeline,
+            fri_decompose_sum_pipeline,
             quotient_pipeline,
             merkle_pipeline,
             merkle_leaf_pipeline,
@@ -209,6 +218,7 @@ impl MetalContext {
             fri_fold_circle_into_line_coords_pipeline,
             blake2s_channel_mix_pipeline,
             blake2s_channel_draw_pipeline,
+            accumulate_m31_pipeline,
             twiddle_cache: Mutex::new(HashMap::new()),
             flat_twiddle_manager: FlatTwiddleManager::new(),
             buffer_pools,
@@ -301,6 +311,11 @@ impl MetalContext {
         &self.fri_decompose_pipeline
     }
 
+    /// Get FRI decompose sum pipeline.
+    pub fn fri_decompose_sum_pipeline(&self) -> &ComputePipelineState {
+        &self.fri_decompose_sum_pipeline
+    }
+
     /// Get quotient accumulation pipeline.
     pub fn quotient_pipeline(&self) -> &ComputePipelineState {
         &self.quotient_pipeline
@@ -359,6 +374,11 @@ impl MetalContext {
     /// Get Blake2s channel draw pipeline (for GPU-resident Fiat-Shamir state).
     pub fn blake2s_channel_draw_pipeline(&self) -> &ComputePipelineState {
         &self.blake2s_channel_draw_pipeline
+    }
+
+    /// Get M31 accumulation pipeline (dst += src elementwise).
+    pub fn accumulate_m31_pipeline(&self) -> &ComputePipelineState {
+        &self.accumulate_m31_pipeline
     }
 
     /// Get or create a flattened twiddle buffer from multiple layers.

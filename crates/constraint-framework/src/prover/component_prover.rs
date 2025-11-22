@@ -221,33 +221,91 @@ impl<E: FrameworkEval + Sync> ComponentProver<MetalBackend> for FrameworkCompone
         )
         .entered();
 
-        // For MetalBackend, we use CPU fallback for constraint evaluation
-        // The GPU is used for FFT/IFFT operations which are the main bottleneck
-        let mut col = accum.col.to_cpu();
+        // MetalBackend uses SIMD for constraint evaluation (same as SimdBackend)
+        // Metal handles FFT above, SIMD handles vectorized constraint evaluation
 
-        // Convert trace to CPU once before the loop
-        let trace_cols = trace.as_cols_ref().map_cols(|c| c.to_cpu());
+        if trace_domain.log_size() < LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS {
+            // Fall back to CPU if the trace is too small
+            let mut col = accum.col.to_cpu();
+            let trace_cols = trace.as_cols_ref().map_cols(|c| c.to_cpu());
 
-        for row in 0..(1 << eval_domain.log_size()) {
-            let trace_cols = trace_cols.as_cols_ref();
-
-            // Evaluate constraints at row
-            let eval = CpuDomainEvaluator::new(
-                &trace_cols,
-                row,
-                &accum.random_coeff_powers,
-                trace_domain.log_size(),
-                eval_domain.log_size(),
-                self.eval.log_size(),
-                self.claimed_sum,
-            );
-            let row_res = self.eval.evaluate(eval).row_res;
-
-            // Finalize row
-            let denom_inv = denom_inv[row >> trace_domain.log_size()];
-            col.set(row, col.at(row) + row_res * denom_inv)
+            for row in 0..(1 << eval_domain.log_size()) {
+                let trace_cols = trace_cols.as_cols_ref();
+                let eval = CpuDomainEvaluator::new(
+                    &trace_cols,
+                    row,
+                    &accum.random_coeff_powers,
+                    trace_domain.log_size(),
+                    eval_domain.log_size(),
+                    self.eval.log_size(),
+                    self.claimed_sum,
+                );
+                let row_res = self.eval.evaluate(eval).row_res;
+                let denom_inv = denom_inv[row >> trace_domain.log_size()];
+                col.set(row, col.at(row) + row_res * denom_inv)
+            }
+            let col = SecureColumnByCoords::<MetalBackend>::from_cpu(col);
+            *accum.col = col;
+            return;
         }
-        let col = SecureColumnByCoords::<MetalBackend>::from_cpu(col);
-        *accum.col = col;
+
+        // Convert Metal trace to SIMD for vectorized evaluation
+        let cpu_col = accum.col.to_cpu();
+        let mut simd_col = SecureColumnByCoords::<SimdBackend>::from_cpu(cpu_col);
+        let simd_trace = trace.as_cols_ref().map_cols(|c| {
+            let cpu_vals = c.to_cpu();
+            CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                c.domain,
+                cpu_vals.into_iter().collect()
+            )
+        });
+
+        // Use vectorized SIMD path (processes 64 elements at once)
+        let col = unsafe { VeryPackedSecureColumnByCoords::transform_under_mut(&mut simd_col) };
+        let range = 0..(1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS));
+
+        #[cfg(not(feature = "parallel"))]
+        let iter = range.step_by(CHUNK_SIZE).zip(col.chunks_mut(CHUNK_SIZE));
+
+        #[cfg(feature = "parallel")]
+        let iter = range
+            .into_par_iter()
+            .step_by(CHUNK_SIZE)
+            .zip(col.chunks_mut(CHUNK_SIZE));
+
+        let self_eval = &self.eval;
+        let self_claimed_sum = self.claimed_sum;
+
+        iter.for_each(|(chunk_idx, mut chunk)| {
+            let trace_cols = simd_trace.as_cols_ref().map_cols(|c| c);
+
+            for idx_in_chunk in 0..CHUNK_SIZE {
+                let vec_row = chunk_idx * CHUNK_SIZE + idx_in_chunk;
+                let eval = SimdDomainEvaluator::new(
+                    &trace_cols,
+                    vec_row,
+                    &accum.random_coeff_powers,
+                    trace_domain.log_size(),
+                    eval_domain.log_size(),
+                    self_eval.log_size(),
+                    self_claimed_sum,
+                );
+                let row_res = self_eval.evaluate(eval).row_res;
+
+                unsafe {
+                    let denom_inv = VeryPackedBaseField::broadcast(
+                        denom_inv[vec_row >> (trace_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS)],
+                    );
+                    chunk.set_packed(
+                        idx_in_chunk,
+                        chunk.packed_at(idx_in_chunk) + row_res * denom_inv,
+                    )
+                }
+            }
+        });
+
+        // Convert SIMD result back to Metal
+        let result_cpu = simd_col.to_cpu();
+        *accum.col = SecureColumnByCoords::<MetalBackend>::from_cpu(result_cpu);
     }
 }
